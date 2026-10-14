@@ -2,6 +2,7 @@ package com.ararmedia.editor
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ararmedia.editor.engine.*
@@ -168,6 +169,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun playVideo() {
         _isPlayingVideo.value = true
+        // Synchronized audio playback through C++ DSP rack and AudioTrack
+        dspProcessor.startPlayback(startMs = _playheadMs.value)
+
         videoPlaybackJob = viewModelScope.launch {
             val frameIntervalMs = 33L // ~30 FPS
             val totalDur = getTotalDurationMs()
@@ -176,6 +180,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 var current = _playheadMs.value + frameIntervalMs
                 if (current >= totalDur) {
                     current = 0L
+                    dspProcessor.seekTo(0L)
                 }
                 _playheadMs.value = current
                 updatePreviewFrame(current)
@@ -188,6 +193,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _isPlayingVideo.value = false
         videoPlaybackJob?.cancel()
         videoPlaybackJob = null
+        dspProcessor.stopPlayback()
     }
 
     fun seekTimeline(timeMs: Long) {
@@ -195,6 +201,47 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val clamped = timeMs.coerceIn(0L, max(1000L, total))
         _playheadMs.value = clamped
         updatePreviewFrame(clamped)
+        if (_isPlayingVideo.value) {
+            dspProcessor.seekTo(clamped)
+        }
+    }
+
+    /**
+     * Imports an external audio file (MP3, WAV, AAC, M4A, OGG) from device storage,
+     * decodes it into PCM, adds it to the BGM track, and loads it into the DSP engine.
+     */
+    fun importAudio(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val decoded = AudioDecoder.decodeUri(getApplication(), uri)
+                if (decoded.samples.isNotEmpty()) {
+                    pushUndoState()
+                    val newClip = TimelineClip(
+                        name = decoded.fileName,
+                        trackType = TrackType.MUSIC_BGM,
+                        startOnTimelineMs = _playheadMs.value,
+                        durationMs = decoded.durationMs,
+                        localUri = decoded.cachedFilePath,
+                        volume = 1.0f
+                    )
+                    _timelineClips.value = _timelineClips.value + newClip
+                    _selectedClipId.value = newClip.id
+
+                    // Load decoded PCM buffer into DSP processor for DAW & Video playback
+                    dspProcessor.loadBuffer(decoded.samples)
+                    _audioBufferData.value = decoded.samples
+
+                    // Auto-detect beat markers and BPM
+                    val (bpm, beats) = dspProcessor.detectBeats()
+                    _detectedBpm.value = bpm
+                    _beatMarkers.value = beats
+
+                    updatePreviewFrame(_playheadMs.value)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 
     fun selectClip(clipId: String?) {

@@ -1,6 +1,8 @@
 package com.ararmedia.editor.ui
 
 import android.graphics.Bitmap
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -51,6 +53,12 @@ fun VideoStudioScreen(
 
     var activeBottomPanel by remember { mutableStateOf<String?>(null) } // "color", "chroma", "speed", "transition", "export"
 
+    val audioPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let { viewModel.importAudio(it) }
+    }
+
     val selectedClip = clips.firstOrNull { it.id == selectedClipId }
 
     Scaffold(
@@ -63,6 +71,10 @@ fun VideoStudioScreen(
                     }
                 },
                 actions = {
+                    // Import Audio Action
+                    IconButton(onClick = { audioPickerLauncher.launch("audio/*") }) {
+                        Icon(Icons.Default.AudioFile, contentDescription = "Import Audio", tint = StudioGoldAccent)
+                    }
                     // Undo & Redo
                     IconButton(onClick = { viewModel.undo() }) {
                         Icon(Icons.Default.Undo, contentDescription = "Undo", tint = Color.LightGray)
@@ -274,6 +286,9 @@ fun VideoStudioScreen(
                 }
                 StudioToolButton(icon = Icons.Default.Audiotrack, label = "Extract Audio", isEnabled = selectedClipId != null) {
                     viewModel.extractAudioFromActiveClip()
+                }
+                StudioToolButton(icon = Icons.Default.LibraryMusic, label = "+ Audio", iconTint = StudioGoldAccent) {
+                    audioPickerLauncher.launch("audio/*")
                 }
                 // Live Mic Voiceover Toggle
                 StudioToolButton(

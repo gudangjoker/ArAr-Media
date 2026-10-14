@@ -1,5 +1,7 @@
 package com.ararmedia.editor.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -45,6 +47,12 @@ fun AudioDawScreen(
     var activePitchSemitones by remember { mutableFloatStateOf(0f) }
     var showExportSheet by remember { mutableStateOf(false) }
 
+    val audioPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let { viewModel.importAudio(it) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -58,6 +66,18 @@ fun AudioDawScreen(
                     }
                 },
                 actions = {
+                    // Import Audio Action
+                    Button(
+                        onClick = { audioPickerLauncher.launch("audio/*") },
+                        colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Icon(Icons.Default.UploadFile, contentDescription = "Import", tint = Color.Black, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Import", color = Color.Black, fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
                     // Export Master Audio
                     Button(
                         onClick = { showExportSheet = true },

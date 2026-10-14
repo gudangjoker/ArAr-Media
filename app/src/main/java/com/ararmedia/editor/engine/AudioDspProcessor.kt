@@ -118,7 +118,7 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
         val minBufSize = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT
+            AudioFormat.ENCODING_PCM_16BIT
         )
 
         audioTrack = AudioTrack.Builder()
@@ -130,7 +130,7 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
             )
             .setAudioFormat(
                 AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setSampleRate(sampleRate)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
@@ -139,6 +139,7 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
+        audioTrack?.setVolume(1.0f)
         audioTrack?.play()
         _isPlaying.value = true
 
@@ -146,6 +147,7 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
             val chunkSize = 4096
             val inChunk = FloatArray(chunkSize)
             val outChunk = FloatArray(chunkSize)
+            val shortChunk = ShortArray(chunkSize)
 
             val startSample = min(((startMs * sampleRate) / 1000L).toInt(), activeBuffer.size)
             var currentSample = startSample
@@ -162,7 +164,12 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
                 }
                 _gainReductionDb.value = grDb
 
-                audioTrack?.write(outChunk, 0, samplesToProcess, AudioTrack.WRITE_BLOCKING)
+                // Convert float [-1.0, 1.0] to 16-bit short PCM for universal hardware playback
+                for (s in 0 until samplesToProcess) {
+                    shortChunk[s] = (outChunk[s].coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
+                }
+
+                audioTrack?.write(shortChunk, 0, samplesToProcess)
 
                 currentSample += samplesToProcess
                 val currentMs = (currentSample.toLong() * 1000L) / sampleRate
