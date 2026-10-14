@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.ararmedia.editor"
     compileSdk = 34
+    ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "com.ararmedia.editor"
