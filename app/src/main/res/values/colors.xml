@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="studio_black">#0A0B10</color>
+    <color name="studio_dark">#12131C</color>
+    <color name="studio_surface">#1A1C29</color>
+    <color name="studio_accent">#00E5FF</color>
+    <color name="studio_purple">#7C4DFF</color>
+    <color name="studio_gold">#FFD600</color>
+</resources>
