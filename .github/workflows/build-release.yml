@@ -3,7 +3,6 @@ name: Build & Publish Release APK
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
@@ -24,14 +23,6 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
           cache: gradle
-
-      - name: Setup Android SDK & NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK 26.1.10909125 and CMake 3.22.1
-        run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "cmake;3.22.1" "ndk;26.1.10909125"
 
       - name: Generate Release Signing Keystore
         run: |
