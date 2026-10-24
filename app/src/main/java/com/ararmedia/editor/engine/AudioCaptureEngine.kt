@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import kotlin.math.max
+import kotlin.math.sqrt
 
 class AudioCaptureEngine(private val context: Context, private val sampleRate: Int = 44100) {
 
@@ -53,40 +54,43 @@ class AudioCaptureEngine(private val context: Context, private val sampleRate: I
             val recordedFloats = mutableListOf<Float>()
             val shortBuf = ShortArray(2048)
 
-            while (isActive && _isRecording.value) {
-                val read = audioRecord?.read(shortBuf, 0, shortBuf.size) ?: 0
-                if (read > 0) {
-                    var sumSquares = 0.0
-                    for (i in 0 until read) {
-                        val f = shortBuf[i] / 32768.0f
-                        recordedFloats.add(f)
-                        sumSquares += f * f
+            try {
+                while (isActive && _isRecording.value) {
+                    val read = audioRecord?.read(shortBuf, 0, shortBuf.size) ?: 0
+                    if (read > 0) {
+                        var sumSquares = 0.0
+                        for (i in 0 until read) {
+                            val f = shortBuf[i] / 32768.0f
+                            recordedFloats.add(f)
+                            sumSquares += f * f
+                        }
+                        val rms = sqrt(sumSquares / read).toFloat()
+                        _currentRmsLevel.value = rms
                     }
-                    val rms = kotlin.math.sqrt(sumSquares / read).toFloat()
-                    _currentRmsLevel.value = rms
                 }
-            }
+            } finally {
+                try {
+                    audioRecord?.stop()
+                    audioRecord?.release()
+                } catch (_: Exception) {}
+                audioRecord = null
+                _currentRmsLevel.value = 0f
 
-            // Save to temp WAV file
-            val capturedArray = recordedFloats.toFloatArray()
-            val tempFile = File(context.cacheDir, "voiceover_${System.currentTimeMillis()}.wav")
-            DemoMediaGenerator.savePcmToWavFile(capturedArray, sampleRate, tempFile)
+                if (recordedFloats.isNotEmpty()) {
+                    val capturedArray = recordedFloats.toFloatArray()
+                    val tempFile = File(context.cacheDir, "voiceover_${System.currentTimeMillis()}.wav")
+                    DemoMediaGenerator.savePcmToWavFile(capturedArray, sampleRate, tempFile)
 
-            withContext(Dispatchers.Main) {
-                onRecordedBuffer(capturedArray, tempFile)
+                    withContext(Dispatchers.Main) {
+                        onRecordedBuffer(capturedArray, tempFile)
+                    }
+                }
             }
         }
     }
 
     fun stopRecording() {
+        // Flip flag to false so the recording loop exits gracefully and invokes onRecordedBuffer!
         _isRecording.value = false
-        recordingJob?.cancel()
-        recordingJob = null
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-        } catch (_: Exception) {}
-        audioRecord = null
-        _currentRmsLevel.value = 0f
     }
 }

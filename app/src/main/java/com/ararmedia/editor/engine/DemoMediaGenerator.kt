@@ -16,56 +16,96 @@ import kotlin.random.Random
 object DemoMediaGenerator {
 
     /**
-     * Synthesizes a real multi-harmonic + speech-cadence + rhythmic beat PCM audio buffer (10 seconds, 44100Hz).
-     * Includes background ambient noise so AI Denoise can be demonstrated immediately!
+     * Synthesizes a rich multi-harmonic + speech-cadence + rhythmic beat PCM audio buffer (10 seconds, 44100Hz).
      */
     fun generateSyntheticAudioBuffer(sampleRate: Int = 44100, durationSec: Int = 10): FloatArray {
         val totalSamples = sampleRate * durationSec
         val buffer = FloatArray(totalSamples)
 
         val beatIntervalSamples = (sampleRate * 0.5).toInt() // 120 BPM = 500ms per beat
+        val rng = Random(42)
 
         for (i in 0 until totalSamples) {
             val t = i.toDouble() / sampleRate
             var sample = 0.0
 
-            // 1. Fundamental Vocal Harmonics (simulate vocal utterance "ArAr Media")
-            val speechEnvelope = (sin(2.0 * PI * 0.8 * t).pow(2.0)).coerceIn(0.0, 1.0)
-            val f0 = 140.0 // Male speech fundamental
-            val vocalHarmonics = sin(2.0 * PI * f0 * t) * 0.35 +
-                    sin(2.0 * PI * (f0 * 2.0) * t) * 0.25 +
-                    sin(2.0 * PI * (f0 * 3.0) * t) * 0.18 +
-                    sin(2.0 * PI * 1200.0 * t) * 0.12 + // Formant F2
-                    sin(2.0 * PI * 2400.0 * t) * 0.08    // Formant F3
-            sample += vocalHarmonics * speechEnvelope * 0.65
+            val inSpeechPhrase = (t in 0.35..2.15) || (t in 2.75..4.55) || (t in 5.25..7.05) || (t in 7.65..9.45)
+            if (inSpeechPhrase) {
+                val syllableMod = (0.55 + 0.45 * sin(2.0 * PI * 4.2 * t)).coerceIn(0.0, 1.0)
+                val f0 = 145.0 + 18.0 * sin(2.0 * PI * 1.5 * t)
+                val vocalHarmonics = sin(2.0 * PI * f0 * t) * 0.32 +
+                        sin(2.0 * PI * (f0 * 2.0) * t) * 0.24 +
+                        sin(2.0 * PI * (f0 * 3.0) * t) * 0.16 +
+                        sin(2.0 * PI * 1150.0 * t) * 0.14 +
+                        sin(2.0 * PI * 2450.0 * t) * 0.09
+                sample += vocalHarmonics * syllableMod * 0.68
+            }
 
-            // 2. Rhythmic Kick Drum at 120 BPM
             val sampleInBeat = i % beatIntervalSamples
             val beatTime = sampleInBeat.toDouble() / sampleRate
-            if (beatTime < 0.25) {
-                // Pitch chirp from 140Hz down to 45Hz
-                val kickFreq = 45.0 + 95.0 * exp(-beatTime * 30.0)
-                val kickEnv = exp(-beatTime * 14.0)
-                sample += sin(2.0 * PI * kickFreq * beatTime) * kickEnv * 0.7
+            if (beatTime < 0.22) {
+                val kickFreq = 48.0 + 92.0 * exp(-beatTime * 32.0)
+                val kickEnv = exp(-beatTime * 15.0)
+                sample += sin(2.0 * PI * kickFreq * beatTime) * kickEnv * 0.65
             }
 
-            // 3. Hi-Hat on 8th notes (every 250ms)
             val eighthSample = i % (beatIntervalSamples / 2)
             val eighthTime = eighthSample.toDouble() / sampleRate
-            if (eighthTime < 0.05) {
-                val hatEnv = exp(-eighthTime * 80.0)
-                val noise = (Random.nextDouble() * 2.0 - 1.0)
-                sample += noise * hatEnv * 0.18
+            if (eighthTime < 0.045) {
+                val hatEnv = exp(-eighthTime * 85.0)
+                val noise = (rng.nextDouble() * 2.0 - 1.0)
+                sample += noise * hatEnv * 0.16
             }
 
-            // 4. Studio Background Hiss / Room Noise Floor (for AI Denoise testing)
-            val backgroundHiss = (Random.nextDouble() * 2.0 - 1.0) * 0.04
+            val backgroundHiss = (rng.nextDouble() * 2.0 - 1.0) * 0.025
             sample += backgroundHiss
 
             buffer[i] = sample.toFloat().coerceIn(-0.98f, 0.98f)
         }
 
         return buffer
+    }
+
+    /**
+     * Generates a true stereo interleaved buffer where vocals are centered (L=R)
+     * and stereo synth chords + hi-hats are panned wide across L/R for 2-Stem Separation.
+     */
+    fun generateSyntheticStereoBuffer(sampleRate: Int = 44100, durationSec: Int = 10): FloatArray {
+        val totalFrames = sampleRate * durationSec
+        val stereo = FloatArray(totalFrames * 2)
+        val beatIntervalSamples = (sampleRate * 0.5).toInt()
+        val rng = Random(42)
+
+        for (i in 0 until totalFrames) {
+            val t = i.toDouble() / sampleRate
+            val inSpeechPhrase = (t in 0.35..2.15) || (t in 2.75..4.55) || (t in 5.25..7.05) || (t in 7.65..9.45)
+
+            var centerVocal = 0.0
+            if (inSpeechPhrase) {
+                val syllableMod = (0.55 + 0.45 * sin(2.0 * PI * 4.2 * t)).coerceIn(0.0, 1.0)
+                val f0 = 145.0 + 18.0 * sin(2.0 * PI * 1.5 * t)
+                centerVocal = (sin(2.0 * PI * f0 * t) * 0.32 +
+                        sin(2.0 * PI * (f0 * 2.0) * t) * 0.24 +
+                        sin(2.0 * PI * 1150.0 * t) * 0.15 +
+                        sin(2.0 * PI * 2450.0 * t) * 0.10) * syllableMod * 0.65
+            }
+
+            val sampleInBeat = i % beatIntervalSamples
+            val beatTime = sampleInBeat.toDouble() / sampleRate
+            var kick = 0.0
+            if (beatTime < 0.22) {
+                val kickFreq = 48.0 + 92.0 * exp(-beatTime * 32.0)
+                kick = sin(2.0 * PI * kickFreq * beatTime) * exp(-beatTime * 15.0) * 0.55
+            }
+
+            val padL = sin(2.0 * PI * 220.0 * t) * 0.15 + sin(2.0 * PI * 329.6 * t) * 0.12
+            val padR = cos(2.0 * PI * 220.0 * t) * 0.15 - sin(2.0 * PI * 329.6 * t) * 0.12
+
+            val hiss = (rng.nextDouble() * 2.0 - 1.0) * 0.02
+            stereo[i * 2] = (centerVocal + kick + padL + hiss).toFloat().coerceIn(-0.98f, 0.98f)
+            stereo[i * 2 + 1] = (centerVocal + kick + padR + hiss).toFloat().coerceIn(-0.98f, 0.98f)
+        }
+        return stereo
     }
 
     /**
@@ -82,26 +122,22 @@ object DemoMediaGenerator {
 
         FileOutputStream(outputFile).use { fos ->
             val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-            // RIFF header
             header.put("RIFF".toByteArray())
             header.putInt(chunkSize)
             header.put("WAVE".toByteArray())
-            // fmt chunk
             header.put("fmt ".toByteArray())
-            header.putInt(16) // Subchunk1Size for PCM
-            header.putShort(1.toShort()) // AudioFormat 1 = PCM
+            header.putInt(16)
+            header.putShort(1.toShort())
             header.putShort(channels.toShort())
             header.putInt(sampleRate)
             header.putInt(byteRate)
             header.putShort(blockAlign.toShort())
             header.putShort(bitsPerSample.toShort())
-            // data chunk
             header.put("data".toByteArray())
             header.putInt(dataSize)
 
             fos.write(header.array())
 
-            // Write 16-bit PCM samples
             val pcmData = ByteBuffer.allocate(dataSize).order(ByteOrder.LITTLE_ENDIAN)
             for (sample in pcm) {
                 val s16 = (sample.coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
@@ -112,25 +148,24 @@ object DemoMediaGenerator {
     }
 
     /**
-     * Synthesizes demo visual frames & video clips for the 5-Track Magnetic Timeline.
+     * Synthesizes clean, cinematic sample clips for the multi-track timeline.
      */
     suspend fun createDemoProject(context: Context): List<TimelineClip> = withContext(Dispatchers.IO) {
         val clips = mutableListOf<TimelineClip>()
         val cacheDir = context.cacheDir
 
-        // 1. Synthetic WAV Audio Buffer
         val audioBuffer = generateSyntheticAudioBuffer()
         val wavFile = File(cacheDir, "demo_master_audio.wav")
         savePcmToWavFile(audioBuffer, 44100, wavFile)
 
-        // 2. Render Main Track Clip 1: Studio Title Card
-        val bmp1 = renderStudioTitleBitmap(width = 1080, height = 1920, title = "ArAr Media Pro", subtitle = "Offline Video & Audio Studio")
+        // 1. Main Track Clip 1: Cinematic Opener
+        val bmp1 = renderStudioTitleBitmap(width = 1080, height = 1920, title = "MIDNIGHT CITY", subtitle = "DIRECTOR'S CUT")
         val bmpFile1 = File(cacheDir, "demo_clip_1.png")
         FileOutputStream(bmpFile1).use { bmp1.compress(Bitmap.CompressFormat.PNG, 100, it) }
 
         clips.add(
             TimelineClip(
-                name = "Intro: Studio Title",
+                name = "Scene 01: Opener",
                 trackType = TrackType.MAIN_VIDEO,
                 startOnTimelineMs = 0L,
                 durationMs = 4000L,
@@ -138,23 +173,24 @@ object DemoMediaGenerator {
                 localUri = bmpFile1.absolutePath,
                 transitionIn = TransitionType.FLASH_WHITE,
                 transitionDurationMs = 600L,
+                animationType = ClipAnimationType.ZOOM_IN,
                 colorGrading = ColorGrading(saturation = 1.15f, contrast = 1.1f),
                 keyframes = listOf(
-                    Keyframe(timestampMs = 0L, scale = 1.0f, opacity = 0.2f),
+                    Keyframe(timestampMs = 0L, scale = 1.0f, opacity = 0.3f),
                     Keyframe(timestampMs = 500L, scale = 1.05f, opacity = 1.0f),
                     Keyframe(timestampMs = 4000L, scale = 1.15f, opacity = 1.0f)
                 )
             )
         )
 
-        // 3. Render Main Track Clip 2: Audio/Video Waveform Scene
+        // 2. Main Track Clip 2: Animated Neon Waves
         val bmp2 = renderNeonWaveformBitmap(width = 1080, height = 1920)
         val bmpFile2 = File(cacheDir, "demo_clip_2.png")
         FileOutputStream(bmpFile2).use { bmp2.compress(Bitmap.CompressFormat.PNG, 100, it) }
 
         clips.add(
             TimelineClip(
-                name = "Scene 2: Cyber Waves",
+                name = "Scene 02: Cyber Waves",
                 trackType = TrackType.MAIN_VIDEO,
                 startOnTimelineMs = 4000L,
                 durationMs = 6000L,
@@ -166,14 +202,14 @@ object DemoMediaGenerator {
             )
         )
 
-        // 4. Render PIP Green Screen Overlay Track
+        // 3. PIP Overlay Track (Chroma Key Ready)
         val greenPip = renderGreenScreenPipBadge(width = 600, height = 600)
         val greenFile = File(cacheDir, "demo_pip_green.png")
         FileOutputStream(greenFile).use { greenPip.compress(Bitmap.CompressFormat.PNG, 100, it) }
 
         clips.add(
             TimelineClip(
-                name = "PIP: Chroma Badge",
+                name = "PIP: Vinyl Disc",
                 trackType = TrackType.PIP_OVERLAY,
                 startOnTimelineMs = 1500L,
                 durationMs = 5000L,
@@ -188,22 +224,22 @@ object DemoMediaGenerator {
                 ),
                 keyframes = listOf(
                     Keyframe(timestampMs = 1500L, scale = 0.4f, translationY = 300f, opacity = 0f),
-                    Keyframe(timestampMs = 2000L, scale = 0.65f, translationY = 200f, opacity = 1f),
-                    Keyframe(timestampMs = 6500L, scale = 0.65f, translationY = 200f, opacity = 1f)
+                    Keyframe(timestampMs = 2000L, scale = 0.58f, translationY = 220f, opacity = 1f),
+                    Keyframe(timestampMs = 6500L, scale = 0.58f, translationY = 220f, rotationDegrees = 45f, opacity = 1f)
                 )
             )
         )
 
-        // 5. Track 3: Text & Auto-Captions
+        // 4. Text & Captions Track
         clips.add(
             TimelineClip(
-                name = "Caption: Title",
+                name = "Subtitle 01",
                 trackType = TrackType.TEXT_STICKER,
-                startOnTimelineMs = 500L,
-                durationMs = 3000L,
-                textContent = "100% OFFLINE MULTI-TRACK STUDIO",
+                startOnTimelineMs = 400L,
+                durationMs = 3100L,
+                textContent = "Every frame tells a story",
                 textStyle = TextStyleSettings(
-                    fontSizeSp = 28f,
+                    fontSizeSp = 26f,
                     textColor = Color(0xFF00E5FF),
                     strokeColor = Color.Black,
                     strokeWidth = 3f,
@@ -213,41 +249,44 @@ object DemoMediaGenerator {
         )
         clips.add(
             TimelineClip(
-                name = "Caption: DSP",
+                name = "Subtitle 02",
                 trackType = TrackType.TEXT_STICKER,
                 startOnTimelineMs = 4200L,
                 durationMs = 4500L,
-                textContent = "C++ 10-Band EQ + AI Voice Denoise",
+                textContent = "Feel the rhythm in motion",
                 textStyle = TextStyleSettings(
                     fontSizeSp = 26f,
                     textColor = Color(0xFFFFD600),
                     strokeColor = Color.Black,
-                    strokeWidth = 3f
+                    strokeWidth = 3f,
+                    isKaraokeHighlighted = true
                 )
             )
         )
 
-        // 6. Track 4: Music / BGM Track with Beat Sync
+        // 5. Music / BGM Track
         clips.add(
             TimelineClip(
-                name = "BGM: Cyber Beat 120BPM",
+                name = "Synthwave Pulse 120BPM",
                 trackType = TrackType.MUSIC_BGM,
                 startOnTimelineMs = 0L,
                 durationMs = 10000L,
                 localUri = wavFile.absolutePath,
+                audioSamples = audioBuffer,
                 volume = 0.85f
             )
         )
 
-        // 7. Track 5: Voiceover Track
+        // 6. Voiceover Track
         clips.add(
             TimelineClip(
-                name = "VO: Studio Voice Harmonic",
+                name = "Narration Track",
                 trackType = TrackType.VOICEOVER,
                 startOnTimelineMs = 1000L,
                 durationMs = 7000L,
                 localUri = wavFile.absolutePath,
-                volume = 1.0f
+                audioSamples = audioBuffer,
+                volume = 0.60f
             )
         )
 
@@ -258,7 +297,6 @@ object DemoMediaGenerator {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
 
-        // Dark Studio Gradient
         val gradient = LinearGradient(
             0f, 0f, width.toFloat(), height.toFloat(),
             intArrayOf(0xFF0A0B10.toInt(), 0xFF141624.toInt(), 0xFF1A1C30.toInt()),
@@ -267,7 +305,6 @@ object DemoMediaGenerator {
         val bgPaint = Paint().apply { shader = gradient }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
 
-        // Cyan / Purple Accent Circles
         val glowPaint = Paint().apply {
             color = 0xFF7C4DFF.toInt()
             alpha = 80
@@ -282,23 +319,23 @@ object DemoMediaGenerator {
         }
         canvas.drawCircle(width * 0.7f, height * 0.65f, 220f, glowCyan)
 
-        // Title Text
         val titlePaint = Paint().apply {
             color = android.graphics.Color.WHITE
-            textSize = 72f
+            textSize = 76f
             isFakeBoldText = true
+            letterSpacing = 0.08f
             textAlign = Paint.Align.CENTER
             setShadowLayer(16f, 0f, 4f, 0xFF00E5FF.toInt())
         }
         canvas.drawText(title, width / 2f, height * 0.48f, titlePaint)
 
-        // Subtitle Text
         val subPaint = Paint().apply {
             color = 0xFF00E5FF.toInt()
-            textSize = 34f
+            textSize = 32f
+            letterSpacing = 0.25f
             textAlign = Paint.Align.CENTER
         }
-        canvas.drawText(subtitle, width / 2f, height * 0.54f, subPaint)
+        canvas.drawText(subtitle, width / 2f, height * 0.535f, subPaint)
 
         return bitmap
     }
@@ -307,11 +344,9 @@ object DemoMediaGenerator {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
 
-        // Cyberpunk background
         val bgPaint = Paint().apply { color = 0xFF0B0D18.toInt() }
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
 
-        // Draw multiple glowing waveform curves
         val path = Path()
         val numPoints = 80
         val centerY = height / 2f
@@ -346,31 +381,36 @@ object DemoMediaGenerator {
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
 
-        // Pure Chroma Green Background (#00FF00)
         canvas.drawColor(0xFF00FF00.toInt())
 
-        // Draw an attractive metallic golden emblem in the center
         val center = width / 2f
-        val emblemPaint = Paint().apply {
-            color = 0xFFFFD600.toInt()
+        val outerVinyl = Paint().apply {
+            color = 0xFF141622.toInt()
             isAntiAlias = true
-            setShadowLayer(12f, 0f, 6f, 0xFF333333.toInt())
+            setShadowLayer(12f, 0f, 6f, 0xFF222222.toInt())
         }
-        canvas.drawCircle(center, center, width * 0.38f, emblemPaint)
+        canvas.drawCircle(center, center, width * 0.38f, outerVinyl)
 
-        val innerPaint = Paint().apply {
-            color = 0xFF12131C.toInt()
+        val groovePaint = Paint().apply {
+            color = 0xFF2C3048.toInt()
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
             isAntiAlias = true
         }
-        canvas.drawCircle(center, center, width * 0.32f, innerPaint)
+        canvas.drawCircle(center, center, width * 0.31f, groovePaint)
+        canvas.drawCircle(center, center, width * 0.25f, groovePaint)
 
-        val textPaint = Paint().apply {
+        val labelPaint = Paint().apply {
             color = 0xFF00E5FF.toInt()
-            textSize = 54f
-            isFakeBoldText = true
-            textAlign = Paint.Align.CENTER
+            isAntiAlias = true
         }
-        canvas.drawText("ARAR", center, center + 15f, textPaint)
+        canvas.drawCircle(center, center, width * 0.14f, labelPaint)
+
+        val holePaint = Paint().apply {
+            color = 0xFF0A0B10.toInt()
+            isAntiAlias = true
+        }
+        canvas.drawCircle(center, center, width * 0.04f, holePaint)
 
         return bitmap
     }

@@ -5,19 +5,17 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.media.*
 import android.os.Build
-import android.os.Environment
 import android.provider.MediaStore
 import com.ararmedia.editor.model.TimelineClip
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
-import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.max
+import kotlin.math.min
 
 enum class VideoResolution(val label: String, val width: Int, val height: Int) {
     HD_720P("720p HD", 720, 1280),
@@ -45,11 +43,13 @@ enum class AudioExportFormat {
 class MediaExportEngine(private val context: Context) {
 
     /**
-     * Exports multi-track timeline into Movies/ArArMedia/ArArMedia_YYYYMMDD_HHMMSS.mp4.
+     * Exports multi-track timeline (Video H.264 AVC + Mastered Audio AAC) into Movies/ArArMedia/ArArMedia_YYYYMMDD_HHMMSS.mp4.
      */
     suspend fun exportVideo(
         clips: List<TimelineClip>,
         timelineEngine: VideoTimelineEngine,
+        masterAudioPcm: FloatArray = FloatArray(0),
+        sampleRate: Int = 44100,
         resolution: VideoResolution = VideoResolution.FHD_1080P,
         frameRate: ExportFrameRate = ExportFrameRate.FPS_30,
         bitrateQuality: BitrateQuality = BitrateQuality.RECOMMENDED,
@@ -58,7 +58,6 @@ class MediaExportEngine(private val context: Context) {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val fileName = "ArArMedia_$timeStamp.mp4"
 
-        // Calculate total timeline duration
         var totalDurationMs = 0L
         for (clip in clips) {
             val end = clip.startOnTimelineMs + clip.durationMs
@@ -66,45 +65,49 @@ class MediaExportEngine(private val context: Context) {
         }
         if (totalDurationMs <= 0L) totalDurationMs = 3000L
 
-        val width = if (timelineEngine.currentAspectRatio.width > timelineEngine.currentAspectRatio.height) {
-            resolution.height // landscape
-        } else {
-            resolution.width // portrait
-        }
-        val height = if (timelineEngine.currentAspectRatio.width > timelineEngine.currentAspectRatio.height) {
-            resolution.width
-        } else {
-            resolution.height
-        }
+        val isLandscape = timelineEngine.currentAspectRatio.width > timelineEngine.currentAspectRatio.height
+        val rawWidth = if (isLandscape) resolution.height else resolution.width
+        val rawHeight = if (isLandscape) resolution.width else resolution.height
 
-        // Align dimensions to multiple of 16 (H.264 requirement)
-        val alignedWidth = (width / 16) * 16
-        val alignedHeight = (height / 16) * 16
+        // Align dimensions to multiple of 16 (H.264 macroblock requirement)
+        val alignedWidth = (rawWidth / 16) * 16
+        val alignedHeight = (rawHeight / 16) * 16
 
-        // Prepare output file destination in cache first, then copy to MediaStore Movies/ArArMedia
         val tempOutputFile = File(context.cacheDir, fileName)
         if (tempOutputFile.exists()) tempOutputFile.delete()
 
         val fps = frameRate.fps
-        val baseBitrate = (alignedWidth * alignedHeight * fps * 0.15f * bitrateQuality.multiplier).toInt()
+        val baseBitrate = (alignedWidth * alignedHeight * fps * 0.14f * bitrateQuality.multiplier).toInt()
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, alignedWidth, alignedHeight).apply {
+        // 1. Pre-encode Audio AAC packets in memory so MediaMuxer can mux Video + Audio tracks cleanly
+        val expectedAudioSamples = ((totalDurationMs * sampleRate) / 1000L).toInt()
+        val paddedAudio = FloatArray(max(sampleRate, expectedAudioSamples))
+        if (masterAudioPcm.isNotEmpty()) {
+            System.arraycopy(masterAudioPcm, 0, paddedAudio, 0, min(masterAudioPcm.size, paddedAudio.size))
+        }
+        val encodedAudio = encodePcmToAacPackets(paddedAudio, sampleRate)
+
+        // 2. Configure Video H.264 Encoder
+        val videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val isSemiPlanar = isSemiPlanarYuvPreferred(videoEncoder.codecInfo)
+
+        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, alignedWidth, alignedHeight).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
             setInteger(MediaFormat.KEY_BIT_RATE, baseBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
 
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoder.start()
+        videoEncoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        videoEncoder.start()
 
         val muxer = MediaMuxer(tempOutputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         var videoTrackIndex = -1
+        var audioTrackIndex = -1
         var muxerStarted = false
 
         val bufferInfo = MediaCodec.BufferInfo()
-        val totalFrames = ((totalDurationMs * fps) / 1000L).toInt()
+        val totalFrames = max(1, ((totalDurationMs * fps) / 1000L).toInt())
         val frameDurationUs = 1_000_000L / fps
 
         try {
@@ -112,68 +115,106 @@ class MediaExportEngine(private val context: Context) {
                 val currentMs = (frameIdx * 1000L) / fps
                 val frameBitmap = timelineEngine.renderFrameAt(currentMs, clips, alignedWidth, alignedHeight)
 
-                // Convert Bitmap to YUV420 / NV12 byte array
-                val yuvData = bitmapToYuv420(frameBitmap, alignedWidth, alignedHeight)
+                val yuvData = bitmapToYuv420(frameBitmap, alignedWidth, alignedHeight, isSemiPlanar)
                 frameBitmap.recycle()
 
-                // Feed into MediaCodec
                 var inputSubmitted = false
-                while (!inputSubmitted) {
-                    val inputBufIndex = encoder.dequeueInputBuffer(10_000)
+                var retries = 0
+                while (!inputSubmitted && retries < 100) {
+                    val inputBufIndex = videoEncoder.dequeueInputBuffer(10_000)
                     if (inputBufIndex >= 0) {
-                        val inputBuffer = encoder.getInputBuffer(inputBufIndex)
+                        val inputBuffer = videoEncoder.getInputBuffer(inputBufIndex)
                         inputBuffer?.clear()
                         inputBuffer?.put(yuvData)
 
                         val pts = frameIdx * frameDurationUs
                         val flags = if (frameIdx == totalFrames - 1) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
-                        encoder.queueInputBuffer(inputBufIndex, 0, yuvData.size, pts, flags)
+                        videoEncoder.queueInputBuffer(inputBufIndex, 0, yuvData.size, pts, flags)
                         inputSubmitted = true
+                    } else {
+                        retries++
                     }
-                    drainEncoder(encoder, muxer, bufferInfo, muxerStarted) { started, trackIdx ->
-                        muxerStarted = started
-                        if (trackIdx >= 0) videoTrackIndex = trackIdx
+
+                    // Drain available output frames while encoding
+                    while (true) {
+                        val outIndex = videoEncoder.dequeueOutputBuffer(bufferInfo, 0)
+                        if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                            if (!muxerStarted) {
+                                videoTrackIndex = muxer.addTrack(videoEncoder.outputFormat)
+                                if (encodedAudio.outputFormat != null) {
+                                    audioTrackIndex = muxer.addTrack(encodedAudio.outputFormat)
+                                }
+                                muxer.start()
+                                muxerStarted = true
+                            }
+                        } else if (outIndex >= 0) {
+                            val outBuffer = videoEncoder.getOutputBuffer(outIndex)
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                                bufferInfo.size = 0
+                            }
+                            if (bufferInfo.size > 0 && muxerStarted && videoTrackIndex >= 0 && outBuffer != null) {
+                                outBuffer.position(bufferInfo.offset)
+                                outBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                                muxer.writeSampleData(videoTrackIndex, outBuffer, bufferInfo)
+                            }
+                            videoEncoder.releaseOutputBuffer(outIndex, false)
+                        } else {
+                            break
+                        }
                     }
                 }
 
-                // Progress update
-                val progress = (frameIdx + 1).toFloat() / totalFrames
+                val progress = ((frameIdx + 1).toFloat() / totalFrames) * 0.92f
                 onProgress(progress)
             }
 
-            // Drain remaining EOS buffers
+            // Drain remaining video EOS buffers
             var eosReached = false
             var drainTries = 0
-            while (!eosReached && drainTries < 30) {
-                val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000)
-                if (outIndex >= 0) {
-                    val outBuffer = encoder.getOutputBuffer(outIndex)
+            while (!eosReached && drainTries < 50) {
+                val outIndex = videoEncoder.dequeueOutputBuffer(bufferInfo, 10_000)
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (!muxerStarted) {
+                        videoTrackIndex = muxer.addTrack(videoEncoder.outputFormat)
+                        if (encodedAudio.outputFormat != null) {
+                            audioTrackIndex = muxer.addTrack(encodedAudio.outputFormat)
+                        }
+                        muxer.start()
+                        muxerStarted = true
+                    }
+                } else if (outIndex >= 0) {
+                    val outBuffer = videoEncoder.getOutputBuffer(outIndex)
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                         bufferInfo.size = 0
                     }
-                    if (bufferInfo.size > 0 && muxerStarted) {
-                        outBuffer?.position(bufferInfo.offset)
-                        outBuffer?.limit(bufferInfo.offset + bufferInfo.size)
-                        muxer.writeSampleData(videoTrackIndex, outBuffer!!, bufferInfo)
+                    if (bufferInfo.size > 0 && muxerStarted && videoTrackIndex >= 0 && outBuffer != null) {
+                        outBuffer.position(bufferInfo.offset)
+                        outBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                        muxer.writeSampleData(videoTrackIndex, outBuffer, bufferInfo)
                     }
-                    encoder.releaseOutputBuffer(outIndex, false)
+                    videoEncoder.releaseOutputBuffer(outIndex, false)
                     if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                         eosReached = true
-                    }
-                } else if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    if (!muxerStarted) {
-                        videoTrackIndex = muxer.addTrack(encoder.outputFormat)
-                        muxer.start()
-                        muxerStarted = true
                     }
                 } else {
                     drainTries++
                 }
             }
+
+            // Write pre-encoded AAC audio packets into the MP4 container
+            if (muxerStarted && audioTrackIndex >= 0) {
+                val audioBufInfo = MediaCodec.BufferInfo()
+                for (pkt in encodedAudio.packets) {
+                    val byteBuf = ByteBuffer.wrap(pkt.bytes)
+                    audioBufInfo.set(0, pkt.bytes.size, pkt.ptsUs, pkt.flags)
+                    muxer.writeSampleData(audioTrackIndex, byteBuf, audioBufInfo)
+                }
+            }
+            onProgress(1.0f)
         } finally {
             try {
-                encoder.stop()
-                encoder.release()
+                videoEncoder.stop()
+                videoEncoder.release()
             } catch (_: Exception) {}
             try {
                 if (muxerStarted) {
@@ -183,52 +224,125 @@ class MediaExportEngine(private val context: Context) {
             } catch (_: Exception) {}
         }
 
-        // Save output into MediaStore Movies/ArArMedia/
-        val savedUri = saveToMoviesMediaStore(context, tempOutputFile, fileName)
-        savedUri
+        saveToMoviesMediaStore(context, tempOutputFile, fileName)
     }
 
-    private fun drainEncoder(
-        encoder: MediaCodec,
-        muxer: MediaMuxer,
-        bufferInfo: MediaCodec.BufferInfo,
-        currentlyStarted: Boolean,
-        onMuxerState: (Boolean, Int) -> Unit
-    ) {
-        var started = currentlyStarted
-        var trackIndex = -1
+    private data class EncodedPacket(val bytes: ByteArray, val ptsUs: Long, val flags: Int)
+    private data class EncodedAudioTrack(val outputFormat: MediaFormat?, val packets: List<EncodedPacket>)
 
-        var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-        while (outIndex >= 0) {
-            val outBuffer = encoder.getOutputBuffer(outIndex)
-            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                bufferInfo.size = 0
+    private fun encodePcmToAacPackets(pcm: FloatArray, sampleRate: Int): EncodedAudioTrack {
+        val packets = mutableListOf<EncodedPacket>()
+        var outputFormat: MediaFormat? = null
+        var encoder: MediaCodec? = null
+
+        try {
+            val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                setInteger(MediaFormat.KEY_BIT_RATE, 192000)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
             }
-            if (bufferInfo.size > 0 && started) {
-                outBuffer?.position(bufferInfo.offset)
-                outBuffer?.limit(bufferInfo.offset + bufferInfo.size)
-                muxer.writeSampleData(trackIndex, outBuffer!!, bufferInfo)
+
+            encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            encoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encoder.start()
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            val shortPcm = ShortArray(pcm.size)
+            for (i in pcm.indices) {
+                shortPcm[i] = (pcm[i].coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
             }
-            encoder.releaseOutputBuffer(outIndex, false)
-            outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
+
+            var pcmOffset = 0
+            val chunkSize = 2048
+            var inputDone = false
+            var outputDone = false
+            var emptyLoops = 0
+
+            while (!outputDone && emptyLoops < 50) {
+                if (!inputDone) {
+                    val inIndex = encoder.dequeueInputBuffer(10_000)
+                    if (inIndex >= 0) {
+                        val inBuf = encoder.getInputBuffer(inIndex)
+                        inBuf?.clear()
+                        val count = (shortPcm.size - pcmOffset).coerceAtMost(chunkSize)
+                        if (count <= 0) {
+                            encoder.queueInputBuffer(inIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            val byteBuf = ByteBuffer.allocate(count * 2).order(ByteOrder.LITTLE_ENDIAN)
+                            for (s in 0 until count) {
+                                byteBuf.putShort(shortPcm[pcmOffset + s])
+                            }
+                            inBuf?.put(byteBuf.array())
+                            val pts = (pcmOffset.toLong() * 1_000_000L) / sampleRate
+                            val isEos = (pcmOffset + count >= shortPcm.size)
+                            encoder.queueInputBuffer(
+                                inIndex,
+                                0,
+                                count * 2,
+                                pts,
+                                if (isEos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0
+                            )
+                            pcmOffset += count
+                            if (isEos) inputDone = true
+                        }
+                    }
+                }
+
+                val outIndex = encoder.dequeueOutputBuffer(bufferInfo, 5_000)
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    outputFormat = encoder.outputFormat
+                } else if (outIndex >= 0) {
+                    val outBuf = encoder.getOutputBuffer(outIndex)
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                        bufferInfo.size = 0
+                    }
+                    if (bufferInfo.size > 0 && outBuf != null) {
+                        outBuf.position(bufferInfo.offset)
+                        outBuf.limit(bufferInfo.offset + bufferInfo.size)
+                        val bytes = ByteArray(bufferInfo.size)
+                        outBuf.get(bytes)
+                        packets.add(EncodedPacket(bytes, bufferInfo.presentationTimeUs, bufferInfo.flags))
+                    }
+                    encoder.releaseOutputBuffer(outIndex, false)
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        outputDone = true
+                    }
+                } else {
+                    if (inputDone) emptyLoops++
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            try {
+                encoder?.stop()
+                encoder?.release()
+            } catch (_: Exception) {}
         }
-        if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED && !started) {
-            trackIndex = muxer.addTrack(encoder.outputFormat)
-            muxer.start()
-            started = true
-            onMuxerState(started, trackIndex)
+
+        return EncodedAudioTrack(outputFormat, packets)
+    }
+
+    private fun isSemiPlanarYuvPreferred(codecInfo: MediaCodecInfo): Boolean {
+        return try {
+            val caps = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
+        } catch (_: Exception) {
+            true
         }
     }
 
     /**
-     * Converts an ARGB_8888 Bitmap to YUV420Planar (I420 / NV12) byte array.
+     * Converts an ARGB_8888 Bitmap to YUV420 (NV12 Semi-Planar or I420 Planar) byte array.
      */
-    private fun bitmapToYuv420(bitmap: Bitmap, width: Int, height: Int): ByteArray {
+    private fun bitmapToYuv420(bitmap: Bitmap, width: Int, height: Int, semiPlanarNv12: Boolean = true): ByteArray {
         val yuv = ByteArray(width * height * 3 / 2)
         val argb = IntArray(width * height)
         bitmap.getPixels(argb, 0, width, 0, 0, width, height)
 
         var yIndex = 0
+        var uvIndex = width * height
         var uIndex = width * height
         var vIndex = uIndex + (width * height / 4)
 
@@ -245,8 +359,13 @@ class MediaExportEngine(private val context: Context) {
                 if (j % 2 == 0 && i % 2 == 0) {
                     val u = ((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128
                     val v = ((112 * r - 94 * g - 18 * b + 128) shr 8) + 128
-                    yuv[uIndex++] = u.coerceIn(0, 255).toByte()
-                    yuv[vIndex++] = v.coerceIn(0, 255).toByte()
+                    if (semiPlanarNv12) {
+                        yuv[uvIndex++] = u.coerceIn(0, 255).toByte()
+                        yuv[uvIndex++] = v.coerceIn(0, 255).toByte()
+                    } else {
+                        yuv[uIndex++] = u.coerceIn(0, 255).toByte()
+                        yuv[vIndex++] = v.coerceIn(0, 255).toByte()
+                    }
                 }
             }
         }
@@ -271,7 +390,6 @@ class MediaExportEngine(private val context: Context) {
             DemoMediaGenerator.savePcmToWavFile(pcmSamples, sampleRate, tempFile)
             onProgress(1.0f)
         } else {
-            // Encode to AAC M4A via MediaCodec
             encodePcmToAacM4a(pcmSamples, sampleRate, tempFile, onProgress)
         }
 
@@ -284,69 +402,30 @@ class MediaExportEngine(private val context: Context) {
         outputFile: File,
         onProgress: (Float) -> Unit
     ) {
-        val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1).apply {
-            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-            setInteger(MediaFormat.KEY_BIT_RATE, 192000)
-            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
-        }
-
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-        encoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoder.start()
+        val encoded = encodePcmToAacPackets(pcm, sampleRate)
+        if (encoded.outputFormat == null) return
 
         val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var audioTrackIndex = -1
         var muxerStarted = false
+        try {
+            val trackIndex = muxer.addTrack(encoded.outputFormat)
+            muxer.start()
+            muxerStarted = true
 
-        val bufferInfo = MediaCodec.BufferInfo()
-        val shortPcm = ShortArray(pcm.size)
-        for (i in pcm.indices) {
-            shortPcm[i] = (pcm[i].coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
+            val bufferInfo = MediaCodec.BufferInfo()
+            val total = max(1, encoded.packets.size)
+            encoded.packets.forEachIndexed { idx, pkt ->
+                val byteBuf = ByteBuffer.wrap(pkt.bytes)
+                bufferInfo.set(0, pkt.bytes.size, pkt.ptsUs, pkt.flags)
+                muxer.writeSampleData(trackIndex, byteBuf, bufferInfo)
+                onProgress((idx + 1).toFloat() / total)
+            }
+        } finally {
+            try {
+                if (muxerStarted) muxer.stop()
+                muxer.release()
+            } catch (_: Exception) {}
         }
-
-        var pcmOffset = 0
-        val chunkSize = 2048
-
-        while (pcmOffset < shortPcm.size) {
-            val inIndex = encoder.dequeueInputBuffer(10_000)
-            if (inIndex >= 0) {
-                val inBuf = encoder.getInputBuffer(inIndex)
-                inBuf?.clear()
-                val count = (shortPcm.size - pcmOffset).coerceAtMost(chunkSize)
-                val byteBuf = ByteBuffer.allocate(count * 2).order(ByteOrder.LITTLE_ENDIAN)
-                for (s in 0 until count) {
-                    byteBuf.putShort(shortPcm[pcmOffset + s])
-                }
-                inBuf?.put(byteBuf.array())
-                val pts = (pcmOffset.toLong() * 1_000_000L) / sampleRate
-                val isEos = (pcmOffset + count >= shortPcm.size)
-                encoder.queueInputBuffer(inIndex, 0, count * 2, pts, if (isEos) MediaCodec.BUFFER_FLAG_END_OF_STREAM else 0)
-                pcmOffset += count
-                onProgress((pcmOffset.toFloat() / shortPcm.size) * 0.9f)
-            }
-
-            var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-            while (outIndex >= 0) {
-                val outBuf = encoder.getOutputBuffer(outIndex)
-                if (bufferInfo.size > 0 && muxerStarted) {
-                    outBuf?.position(bufferInfo.offset)
-                    outBuf?.limit(bufferInfo.offset + bufferInfo.size)
-                    muxer.writeSampleData(audioTrackIndex, outBuf!!, bufferInfo)
-                }
-                encoder.releaseOutputBuffer(outIndex, false)
-                outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-            }
-            if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED && !muxerStarted) {
-                audioTrackIndex = muxer.addTrack(encoder.outputFormat)
-                muxer.start()
-                muxerStarted = true
-            }
-        }
-
-        encoder.stop()
-        encoder.release()
-        if (muxerStarted) muxer.stop()
-        muxer.release()
         onProgress(1.0f)
     }
 

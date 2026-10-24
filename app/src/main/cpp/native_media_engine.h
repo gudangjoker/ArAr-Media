@@ -128,7 +128,7 @@ public:
     double wet;
     double dry;
 
-    Freeverb() : roomSize(0.6), damp(0.25), wet(0.3), dry(0.7) {
+    Freeverb() : roomSize(0.6), damp(0.25), wet(0.0), dry(1.0) {
         const size_t combTunings[8] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
         const size_t allpassTunings[4] = {556, 441, 341, 225};
 
@@ -155,6 +155,7 @@ public:
     }
 
     inline double process(double input) {
+        if (wet <= 0.001) return input;
         double outComb = 0.0;
         for (auto& c : combFilters) {
             outComb += c.process(input);
@@ -164,6 +165,67 @@ public:
             outAllpass = a.process(outAllpass);
         }
         return (dry * input) + (wet * outAllpass);
+    }
+};
+
+// --- Dual-Delay-Line Pitch Shifter (Crossfading Grain Delay) ---
+class GranularPitchShifter {
+public:
+    static const size_t BUFFER_SIZE = 4096;
+    static const size_t GRAIN_SIZE = 1024;
+    std::vector<double> buffer;
+    size_t writePos;
+    double phase;
+
+    GranularPitchShifter() : writePos(0), phase(0.0) {
+        buffer.assign(BUFFER_SIZE, 0.0);
+    }
+
+    void reset() {
+        std::fill(buffer.begin(), buffer.end(), 0.0);
+        writePos = 0;
+        phase = 0.0;
+    }
+
+    inline double readInterpolated(double delaySamples) const {
+        double readIdx = static_cast<double>(writePos) - delaySamples;
+        while (readIdx < 0.0) readIdx += static_cast<double>(BUFFER_SIZE);
+        while (readIdx >= static_cast<double>(BUFFER_SIZE)) readIdx -= static_cast<double>(BUFFER_SIZE);
+
+        size_t idx0 = static_cast<size_t>(readIdx) % BUFFER_SIZE;
+        size_t idx1 = (idx0 + 1) % BUFFER_SIZE;
+        double frac = readIdx - std::floor(readIdx);
+        return buffer[idx0] * (1.0 - frac) + buffer[idx1] * frac;
+    }
+
+    inline double process(double input, double pitchFactor) {
+        buffer[writePos] = input;
+        writePos = (writePos + 1) % BUFFER_SIZE;
+
+        if (std::abs(pitchFactor - 1.0) < 0.005) {
+            return input;
+        }
+
+        // Rate of delay change
+        double rate = (1.0 - pitchFactor) / static_cast<double>(GRAIN_SIZE);
+        phase += rate;
+        while (phase >= 1.0) phase -= 1.0;
+        while (phase < 0.0) phase += 1.0;
+
+        double phase2 = phase + 0.5;
+        if (phase2 >= 1.0) phase2 -= 1.0;
+
+        double delay1 = phase * static_cast<double>(GRAIN_SIZE) + 64.0;
+        double delay2 = phase2 * static_cast<double>(GRAIN_SIZE) + 64.0;
+
+        // Hann crossfade window
+        double win1 = 0.5 * (1.0 - std::cos(2.0 * M_PI * phase));
+        double win2 = 0.5 * (1.0 - std::cos(2.0 * M_PI * phase2));
+
+        double s1 = readInterpolated(delay1);
+        double s2 = readInterpolated(delay2);
+
+        return s1 * win1 + s2 * win2;
     }
 };
 
@@ -242,6 +304,7 @@ public:
 
     StudioCompressor compressor;
     Freeverb reverb;
+    GranularPitchShifter pitchShifter;
 
     // Pitch Shift & Voice Changer
     float pitchSemitones;

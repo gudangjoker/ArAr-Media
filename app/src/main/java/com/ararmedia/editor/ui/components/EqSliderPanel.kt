@@ -13,7 +13,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ararmedia.editor.ui.theme.StudioCyanAccent
@@ -72,7 +76,6 @@ fun EqSliderPanel(
             val h = size.height
             val midY = h / 2f
 
-            // Center 0dB line
             drawLine(
                 color = Color.White.copy(alpha = 0.15f),
                 start = Offset(0f, midY),
@@ -96,18 +99,18 @@ fun EqSliderPanel(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // 10 Vertical Sliders in Horizontal Row
+        // 10 True Vertical Fader Sliders in Horizontal Row
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
             for (i in 0 until 10) {
-                val gain = bandGains[i]
+                val gain = if (i < bandGains.size) bandGains[i] else 0f
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.width(36.dp)
+                    modifier = Modifier.width(42.dp)
                 ) {
                     Text(
                         text = String.format(Locale.US, "%+.1f", gain),
@@ -115,19 +118,41 @@ fun EqSliderPanel(
                         color = if (gain != 0f) StudioCyanAccent else Color.Gray
                     )
 
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    // True Vertical Slider using layout swap + 270deg rotation
                     Slider(
                         value = gain,
                         onValueChange = { onGainChange(i, it) },
                         valueRange = -15f..15f,
                         modifier = Modifier
-                            .height(110.dp)
-                            .padding(vertical = 0.dp),
+                            .graphicsLayer {
+                                rotationZ = 270f
+                                transformOrigin = TransformOrigin(0f, 0f)
+                            }
+                            .layout { measurable, constraints ->
+                                val placeable = measurable.measure(
+                                    Constraints(
+                                        minWidth = constraints.minHeight,
+                                        maxWidth = constraints.maxHeight,
+                                        minHeight = constraints.minWidth,
+                                        maxHeight = constraints.maxWidth
+                                    )
+                                )
+                                layout(placeable.height, placeable.width) {
+                                    placeable.place(-placeable.width, 0)
+                                }
+                            }
+                            .width(120.dp)
+                            .height(36.dp),
                         colors = SliderDefaults.colors(
                             thumbColor = StudioCyanAccent,
                             activeTrackColor = StudioCyanAccent,
                             inactiveTrackColor = Color(0xFF2C3048)
                         )
                     )
+
+                    Spacer(modifier = Modifier.height(4.dp))
 
                     Text(
                         text = bandLabels[i],

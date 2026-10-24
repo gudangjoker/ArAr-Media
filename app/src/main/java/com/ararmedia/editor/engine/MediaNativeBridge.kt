@@ -89,6 +89,13 @@ object MediaNativeBridge {
         spillSuppression: Float
     )
 
+    external fun processSmartCutout(
+        srcBitmap: Bitmap,
+        dstBitmap: Bitmap,
+        sensitivity: Float,
+        feather: Float
+    )
+
     external fun processStabilization(
         prevFrame: Bitmap,
         currFrame: Bitmap,

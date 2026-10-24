@@ -3,6 +3,8 @@ package com.ararmedia.editor.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -14,8 +16,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ararmedia.editor.StudioViewModel
@@ -31,6 +35,7 @@ fun AudioDawScreen(
     modifier: Modifier = Modifier
 ) {
     val audioSamples by viewModel.audioBufferData.collectAsState()
+    val eqGains by viewModel.eqGainsFlow.collectAsState()
     val selection by viewModel.audioSelection.collectAsState()
     val playheadMs by viewModel.dawPlaybackMs.collectAsState()
     val isPlaying by viewModel.isDawPlaying.collectAsState()
@@ -39,13 +44,28 @@ fun AudioDawScreen(
     val stemResult by viewModel.stemSplitResult.collectAsState()
     val vocalFader by viewModel.vocalFader.collectAsState()
     val backingFader by viewModel.backingFader.collectAsState()
+    val requestedDawTab by viewModel.requestedDawTab.collectAsState()
+    val isAiProcessing by viewModel.isAiProcessing.collectAsState()
+    val aiStatusMessage by viewModel.aiStatusMessage.collectAsState()
+
     val isExporting by viewModel.isExporting.collectAsState()
     val exportProgress by viewModel.exportProgress.collectAsState()
     val exportMessage by viewModel.exportMessage.collectAsState()
 
-    var activeTab by remember { mutableIntStateOf(0) } // 0=Waveform Tools, 1=10-Band EQ, 2=Compressor, 3=Voice/FX, 4=AI Stem Splitter
+    var activeTab by remember { mutableIntStateOf(0) } // 0=Waveform Tools, 1=10-Band EQ, 2=Dynamics, 3=Voice/FX, 4=Stem Splitter
     var activePitchSemitones by remember { mutableFloatStateOf(0f) }
+    var activePresetId by remember { mutableIntStateOf(0) }
     var showExportSheet by remember { mutableStateOf(false) }
+
+    LaunchedEffect(requestedDawTab) {
+        if (requestedDawTab != null) {
+            activeTab = requestedDawTab!!
+            if (requestedDawTab == 4 && stemResult == null) {
+                viewModel.runStemSeparation()
+            }
+            viewModel.consumeRequestedDawTab()
+        }
+    }
 
     val audioPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -55,41 +75,83 @@ fun AudioDawScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("ArAr Audio DAW & Mastering", style = MaterialTheme.typography.titleMedium, color = Color.White)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(formatTimecode(playheadMs), fontSize = 11.sp, color = StudioGoldAccent)
-                            Text("• BPM: ${detectedBpm.toInt()}", fontSize = 11.sp, color = StudioCyanAccent)
+            Surface(
+                color = StudioDarkBackground,
+                tonalElevation = 0.dp
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp)
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    // Left: Back to Home + Workspace Switcher Pill (Video | Audio)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        IconButton(
+                            onClick = { viewModel.navigateTo(0) },
+                            modifier = Modifier.size(34.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Home", tint = Color.White, modifier = Modifier.size(20.dp))
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .background(StudioSurfaceVariant, RoundedCornerShape(16.dp))
+                                .padding(2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .clickable { viewModel.navigateTo(1) }
+                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text("Video", fontSize = 11.sp, color = Color.LightGray)
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(StudioGoldAccent)
+                                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                            ) {
+                                Text("Audio", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                            }
                         }
                     }
-                },
-                actions = {
-                    // Import Audio Action
-                    Button(
-                        onClick = { audioPickerLauncher.launch("audio/*") },
-                        colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        modifier = Modifier.height(32.dp)
+
+                    // Right: Import + Export Audio
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(Icons.Default.UploadFile, contentDescription = "Import", tint = Color.Black, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Import", color = Color.Black, fontSize = 12.sp)
+                        OutlinedButton(
+                            onClick = { audioPickerLauncher.launch("audio/*") },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.height(30.dp)
+                        ) {
+                            Icon(Icons.Default.UploadFile, contentDescription = "Import", tint = StudioCyanAccent, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Import", color = Color.White, fontSize = 11.sp)
+                        }
+
+                        Button(
+                            onClick = { showExportSheet = true },
+                            colors = ButtonDefaults.buttonColors(containerColor = StudioGoldAccent),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.height(30.dp)
+                        ) {
+                            Text("Export", color = Color.Black, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
-                    Spacer(modifier = Modifier.width(6.dp))
-                    // Export Master Audio
-                    Button(
-                        onClick = { showExportSheet = true },
-                        colors = ButtonDefaults.buttonColors(containerColor = StudioGoldAccent),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                        modifier = Modifier.height(32.dp)
-                    ) {
-                        Text("Export Audio", color = Color.Black, fontSize = 12.sp)
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = StudioDarkBackground)
-            )
+                }
+            }
         },
         containerColor = StudioDarkBackground
     ) { paddingValues ->
@@ -98,7 +160,7 @@ fun AudioDawScreen(
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            // 1. Zoomable High-Precision Dual-Channel Waveform Canvas
+            // 1. High-Precision Waveform Canvas
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -115,7 +177,18 @@ fun AudioDawScreen(
                     onSeek = { viewModel.seekDaw(it) }
                 )
 
-                // Selection timecode overlay pill
+                // Timecode & BPM Overlay
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .background(StudioSurfaceVariant.copy(alpha = 0.85f), RoundedCornerShape(6.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(formatTimecode(playheadMs), fontSize = 10.sp, color = Color.White, fontWeight = FontWeight.Medium)
+                    Text("${detectedBpm.toInt()} BPM", fontSize = 10.sp, color = StudioCyanAccent)
+                }
+
                 if (selection.isActive) {
                     val selDur = selection.endMs - selection.startMs
                     Box(
@@ -125,20 +198,40 @@ fun AudioDawScreen(
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     ) {
                         Text(
-                            text = "Sel: ${selection.startMs}ms - ${selection.endMs}ms (${selDur}ms)",
+                            text = "${selection.startMs}ms - ${selection.endMs}ms (${selDur}ms)",
                             fontSize = 10.sp,
                             color = StudioCyanAccent
                         )
                     }
                 }
 
-                // Transport Play/Pause Floating Pill
+                if (isAiProcessing || aiStatusMessage != null) {
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .background(StudioSurfaceVariant.copy(alpha = 0.92f), RoundedCornerShape(20.dp))
+                            .border(1.dp, StudioGoldAccent.copy(alpha = 0.4f), RoundedCornerShape(20.dp))
+                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (isAiProcessing) {
+                            CircularProgressIndicator(
+                                color = StudioGoldAccent,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(13.dp)
+                            )
+                        }
+                        Text(aiStatusMessage ?: "Processing...", fontSize = 11.sp, color = Color.White)
+                    }
+                }
+
                 FloatingActionButton(
                     onClick = { viewModel.toggleDawPlayback() },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(bottom = 6.dp)
-                        .size(44.dp),
+                        .size(42.dp),
                     containerColor = StudioGoldAccent,
                     contentColor = Color.Black
                 ) {
@@ -149,7 +242,7 @@ fun AudioDawScreen(
                 }
             }
 
-            // 2. Tab Selector: Waveform Tools | 10-Band EQ | Dynamics | Voice/FX | AI Stems
+            // 2. Tab Selector
             ScrollableTabRow(
                 selectedTabIndex = activeTab,
                 containerColor = StudioSurface,
@@ -157,11 +250,11 @@ fun AudioDawScreen(
                 edgePadding = 8.dp,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Tab(selected = activeTab == 0, onClick = { activeTab = 0 }, text = { Text("Waveform Tools", fontSize = 11.sp) })
+                Tab(selected = activeTab == 0, onClick = { activeTab = 0 }, text = { Text("Waveform Edit", fontSize = 11.sp) })
                 Tab(selected = activeTab == 1, onClick = { activeTab = 1 }, text = { Text("10-Band EQ", fontSize = 11.sp) })
-                Tab(selected = activeTab == 2, onClick = { activeTab = 2 }, text = { Text("Dynamics / Limiter", fontSize = 11.sp) })
-                Tab(selected = activeTab == 3, onClick = { activeTab = 3 }, text = { Text("Voice / FX", fontSize = 11.sp) })
-                Tab(selected = activeTab == 4, onClick = { activeTab = 4 }, text = { Text("AI Stem Splitter", fontSize = 11.sp) })
+                Tab(selected = activeTab == 2, onClick = { activeTab = 2 }, text = { Text("Compressor", fontSize = 11.sp) })
+                Tab(selected = activeTab == 3, onClick = { activeTab = 3 }, text = { Text("Voice & Reverb", fontSize = 11.sp) })
+                Tab(selected = activeTab == 4, onClick = { activeTab = 4 }, text = { Text("Stem Splitter", fontSize = 11.sp) })
             }
 
             // 3. Tab Contents
@@ -170,11 +263,10 @@ fun AudioDawScreen(
                     .fillMaxWidth()
                     .weight(0.62f)
                     .background(StudioDarkBackground)
-                    .padding(8.dp)
+                    .padding(10.dp)
             ) {
                 when (activeTab) {
                     0 -> {
-                        // Waveform Region Actions
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -182,9 +274,10 @@ fun AudioDawScreen(
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Text(
-                                "Waveform Selection Actions (Audacity Precision):",
+                                "Waveform Selection & Mastering",
                                 fontSize = 12.sp,
-                                color = StudioCyanAccent
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White
                             )
 
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -224,30 +317,29 @@ fun AudioDawScreen(
                                 ) { viewModel.normalizeAudio(-1f) }
 
                                 DawActionButton(
-                                    label = "Reverse Audio",
-                                    icon = Icons.Default.RotateLeft,
+                                    label = "Reverse",
+                                    icon = Icons.Default.History,
                                     modifier = Modifier.weight(1f)
                                 ) { viewModel.reverseAudio() }
                             }
 
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 DawActionButton(
-                                    label = "Fade In (1.5s)",
+                                    label = "Fade In",
                                     icon = Icons.Default.TrendingUp,
                                     modifier = Modifier.weight(1f)
                                 ) { viewModel.fadeInAudio() }
 
                                 DawActionButton(
-                                    label = "Fade Out (1.5s)",
+                                    label = "Fade Out",
                                     icon = Icons.Default.TrendingDown,
                                     modifier = Modifier.weight(1f)
                                 ) { viewModel.fadeOutAudio() }
                             }
 
-                            Divider(color = StudioCardBorder, modifier = Modifier.padding(vertical = 4.dp))
+                            HorizontalDivider(color = StudioCardBorder, modifier = Modifier.padding(vertical = 4.dp))
 
-                            // Offline Audio AI Suite
-                            Text("Offline Audio AI Suite:", fontSize = 12.sp, color = StudioGoldAccent)
+                            Text("AI Audio Tools", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Button(
                                     onClick = { viewModel.applyAiDenoise() },
@@ -255,31 +347,29 @@ fun AudioDawScreen(
                                     modifier = Modifier.weight(1f)
                                 ) {
                                     Icon(Icons.Default.NoiseAware, contentDescription = "Denoise", modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("AI Studio Denoise", fontSize = 11.sp)
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("AI Noise Reduction", fontSize = 11.sp)
                                 }
 
                                 Button(
                                     onClick = { activeTab = 4; viewModel.runStemSeparation() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00B0FF)),
+                                    colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent),
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    Icon(Icons.Default.CallSplit, contentDescription = "Split Stems", modifier = Modifier.size(16.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Separate Stems", fontSize = 11.sp)
+                                    Icon(Icons.Default.CallSplit, contentDescription = "Split Stems", tint = Color.Black, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Vocal Remover", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
                     }
                     1 -> {
-                        // 10-Band Parametric EQ
                         EqSliderPanel(
-                            bandGains = viewModel.dspProcessor.eqGains,
+                            bandGains = eqGains,
                             onGainChange = { band, gain -> viewModel.setEqGain(band, gain) }
                         )
                     }
                     2 -> {
-                        // Dynamics Processor (Compressor & Limiter)
                         CompressorPanel(
                             gainReductionDb = gainReductionDb,
                             onCompressorChange = { thresh, ratio, att, rel, makeup ->
@@ -288,21 +378,19 @@ fun AudioDawScreen(
                         )
                     }
                     3 -> {
-                        // Voice Changer & Reverb Engine
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Text("Voice Changer & Pitch Shifter:", fontSize = 12.sp, color = StudioCyanAccent)
+                            Text("Pitch Shift & Voice Effects", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
 
-                            // Pitch Shift Slider (-12 to +12 Semitones)
                             Column {
                                 Text(
-                                    text = "Pitch Shift: ${String.format(Locale.US, "%+.1f Semitones", activePitchSemitones)}",
+                                    text = "Pitch: ${String.format(Locale.US, "%+.1f Semitones", activePitchSemitones)}",
                                     fontSize = 11.sp,
-                                    color = Color.White
+                                    color = Color.LightGray
                                 )
                                 Slider(
                                     value = activePitchSemitones,
@@ -315,17 +403,15 @@ fun AudioDawScreen(
                                 )
                             }
 
-                            // Presets
-                            Text("Voice Changer Presets:", fontSize = 11.sp, color = Color.LightGray)
                             val presets = listOf(
-                                0 to "Standard Natural",
-                                1 to "Deep Podcast Voice",
-                                2 to "Helium / Chipmunk",
-                                3 to "Vintage Megaphone",
-                                4 to "Studio Radio Broadcast",
+                                0 to "Natural",
+                                1 to "Deep Podcast",
+                                2 to "Chipmunk",
+                                3 to "Megaphone",
+                                4 to "Radio Broadcast",
                                 5 to "Cyber Robot",
-                                6 to "Monster Voice",
-                                7 to "Cathedral Reverb"
+                                6 to "Monster",
+                                7 to "Cathedral"
                             )
                             Row(
                                 modifier = Modifier
@@ -334,22 +420,33 @@ fun AudioDawScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 for ((id, name) in presets) {
-                                    Button(
-                                        onClick = { viewModel.setVoicePreset(id) },
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                        colors = ButtonDefaults.buttonColors(containerColor = StudioSurfaceVariant)
-                                    ) {
-                                        Text(name, fontSize = 11.sp, color = Color.White)
-                                    }
+                                    val isSelected = activePresetId == id
+                                    FilterChip(
+                                        selected = isSelected,
+                                        onClick = {
+                                            activePresetId = id
+                                            viewModel.setVoicePreset(id)
+                                            activePitchSemitones = when (id) {
+                                                1 -> -2.5f
+                                                2 -> 7.0f
+                                                6 -> -6.5f
+                                                else -> 0.0f
+                                            }
+                                        },
+                                        label = { Text(name, fontSize = 11.sp) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = StudioCyanAccent,
+                                            selectedLabelColor = Color.Black
+                                        )
+                                    )
                                 }
                             }
 
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(4.dp))
 
-                            // Spatial Reverb Controls
-                            Text("Freeverb Spatial Reverb:", fontSize = 12.sp, color = StudioGoldAccent)
+                            Text("Spatial Reverb & Delay", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
                             var roomSize by remember { mutableFloatStateOf(0.6f) }
-                            var wetMix by remember { mutableFloatStateOf(0.3f) }
+                            var wetMix by remember { mutableFloatStateOf(0.0f) }
                             var delayMs by remember { mutableFloatStateOf(180f) }
 
                             fun updateReverb() {
@@ -358,7 +455,7 @@ fun AudioDawScreen(
 
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Room Size: ${(roomSize * 100).toInt()}%", fontSize = 10.sp, color = Color.White)
+                                    Text("Room: ${(roomSize * 100).toInt()}%", fontSize = 10.sp, color = Color.LightGray)
                                     Slider(
                                         value = roomSize,
                                         onValueChange = { roomSize = it; updateReverb() },
@@ -367,7 +464,7 @@ fun AudioDawScreen(
                                     )
                                 }
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Wet Mix: ${(wetMix * 100).toInt()}%", fontSize = 10.sp, color = Color.White)
+                                    Text("Mix: ${(wetMix * 100).toInt()}%", fontSize = 10.sp, color = Color.LightGray)
                                     Slider(
                                         value = wetMix,
                                         onValueChange = { wetMix = it; updateReverb() },
@@ -375,11 +472,19 @@ fun AudioDawScreen(
                                         colors = SliderDefaults.colors(thumbColor = StudioGoldAccent, activeTrackColor = StudioGoldAccent)
                                     )
                                 }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Delay: ${delayMs.toInt()} ms", fontSize = 10.sp, color = Color.LightGray)
+                                    Slider(
+                                        value = delayMs,
+                                        onValueChange = { delayMs = it; updateReverb() },
+                                        valueRange = 0f..500f,
+                                        colors = SliderDefaults.colors(thumbColor = StudioGoldAccent, activeTrackColor = StudioGoldAccent)
+                                    )
+                                }
                             }
                         }
                     }
                     4 -> {
-                        // AI Stem Splitter Panel (Vocals vs Accompaniment)
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -387,9 +492,10 @@ fun AudioDawScreen(
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             Text(
-                                "AI 2-Stem Isolation (Lead Vocals vs Instrumental):",
+                                "AI 2-Stem Separation (Vocals & Instrumental)",
                                 fontSize = 12.sp,
-                                color = StudioCyanAccent
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White
                             )
 
                             if (stemResult == null) {
@@ -402,28 +508,33 @@ fun AudioDawScreen(
                                 ) {
                                     Button(
                                         onClick = { viewModel.runStemSeparation() },
+                                        enabled = !isAiProcessing,
                                         colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent)
                                     ) {
-                                        Icon(Icons.Default.CallSplit, contentDescription = "Split", tint = Color.Black)
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("Extract Vocals & Instrumental Stems", color = Color.Black)
+                                        if (isAiProcessing) {
+                                            CircularProgressIndicator(color = Color.Black, strokeWidth = 2.dp, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text("Separating Stems...", color = Color.Black)
+                                        } else {
+                                            Icon(Icons.Default.CallSplit, contentDescription = "Split", tint = Color.Black)
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Separate Vocals & Instrumental", color = Color.Black, fontWeight = FontWeight.SemiBold)
+                                        }
                                     }
                                 }
                             } else {
-                                // Stem Faders
                                 Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .background(StudioSurfaceVariant, RoundedCornerShape(12.dp))
                                         .padding(12.dp)
                                 ) {
-                                    // Vocals Fader
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("Lead Vocals Stem:", color = StudioCyanAccent, fontSize = 12.sp)
+                                        Text("Lead Vocals", color = StudioCyanAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                         Text("${(vocalFader * 100).toInt()}%", color = Color.White, fontSize = 12.sp)
                                     }
                                     Slider(
@@ -433,15 +544,14 @@ fun AudioDawScreen(
                                         colors = SliderDefaults.colors(thumbColor = StudioCyanAccent, activeTrackColor = StudioCyanAccent)
                                     )
 
-                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Spacer(modifier = Modifier.height(6.dp))
 
-                                    // Backing Track Fader
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.SpaceBetween,
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("Instruments & Backing Stem:", color = StudioGoldAccent, fontSize = 12.sp)
+                                        Text("Instrumental Backing", color = StudioGoldAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                         Text("${(backingFader * 100).toInt()}%", color = Color.White, fontSize = 12.sp)
                                     }
                                     Slider(
@@ -450,6 +560,52 @@ fun AudioDawScreen(
                                         valueRange = 0f..1.5f,
                                         colors = SliderDefaults.colors(thumbColor = StudioGoldAccent, activeTrackColor = StudioGoldAccent)
                                     )
+
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                viewModel.setVocalStemFader(1.0f)
+                                                viewModel.setBackingStemFader(0.0f)
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Solo Vocals", fontSize = 11.sp, color = StudioCyanAccent)
+                                        }
+                                        OutlinedButton(
+                                            onClick = {
+                                                viewModel.setVocalStemFader(0.0f)
+                                                viewModel.setBackingStemFader(1.0f)
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Solo Instrumental", fontSize = 11.sp, color = StudioGoldAccent)
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = {
+                                                viewModel.sendSeparatedStemToTimeline(useVocals = true)
+                                                viewModel.navigateTo(1)
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Add Vocals to Video", fontSize = 10.sp, color = Color.Black, fontWeight = FontWeight.SemiBold)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                viewModel.sendSeparatedStemToTimeline(useVocals = false)
+                                                viewModel.navigateTo(1)
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = StudioGoldAccent),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Add Backing to Video", fontSize = 10.sp, color = Color.Black, fontWeight = FontWeight.SemiBold)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -459,7 +615,6 @@ fun AudioDawScreen(
         }
     }
 
-    // Audio Export Bottom Sheet
     if (showExportSheet) {
         ModalBottomSheet(
             onDismissRequest = { showExportSheet = false },
@@ -471,8 +626,8 @@ fun AudioDawScreen(
                     .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Text("Export Mastered Audio", style = MaterialTheme.typography.titleMedium, color = StudioGoldAccent)
-                Text("Direct output to Music/ArArMedia/", fontSize = 11.sp, color = Color.LightGray)
+                Text("Export Mastered Audio", style = MaterialTheme.typography.titleMedium, color = Color.White, fontWeight = FontWeight.Bold)
+                Text("Saves to Music/ArArMedia/", fontSize = 11.sp, color = Color.LightGray)
 
                 Button(
                     onClick = {
@@ -482,7 +637,7 @@ fun AudioDawScreen(
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = StudioGoldAccent)
                 ) {
-                    Text("Export Uncompressed Lossless WAV (16-bit 44.1kHz)", color = Color.Black)
+                    Text("Export Lossless WAV (16-bit 44.1kHz)", color = Color.Black, fontWeight = FontWeight.SemiBold)
                 }
 
                 Button(
@@ -493,21 +648,20 @@ fun AudioDawScreen(
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent)
                 ) {
-                    Text("Export Compressed M4A (AAC 192kbps)", color = Color.Black)
+                    Text("Export M4A (AAC 192kbps)", color = Color.Black, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
     }
 
-    // Export Progress Dialog
     if (isExporting) {
         AlertDialog(
             onDismissRequest = {},
             containerColor = StudioSurfaceVariant,
-            title = { Text("Master Audio Export", color = StudioGoldAccent) },
+            title = { Text("Exporting Audio", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
             text = {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(exportMessage ?: "Rendering PCM samples...", color = Color.White, fontSize = 12.sp)
+                    Text(exportMessage ?: "Rendering audio...", color = Color.LightGray, fontSize = 12.sp)
                     Spacer(modifier = Modifier.height(12.dp))
                     LinearProgressIndicator(
                         progress = { exportProgress },

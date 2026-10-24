@@ -2,7 +2,11 @@ package com.ararmedia.editor
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ararmedia.editor.engine.*
@@ -10,7 +14,10 @@ import com.ararmedia.editor.model.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import java.io.File
+import java.io.FileOutputStream
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 
 class StudioViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -22,6 +29,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     // Navigation Tab: 0 = Home, 1 = Video Studio, 2 = Audio DAW
     private val _currentScreen = MutableStateFlow(0)
     val currentScreen: StateFlow<Int> = _currentScreen.asStateFlow()
+
+    private val _requestedToolPanel = MutableStateFlow<String?>(null)
+    val requestedToolPanel: StateFlow<String?> = _requestedToolPanel.asStateFlow()
+
+    private val _requestedDawTab = MutableStateFlow<Int?>(null)
+    val requestedDawTab: StateFlow<Int?> = _requestedDawTab.asStateFlow()
 
     // --- VIDEO STUDIO STATE ---
     private val _timelineClips = MutableStateFlow<List<TimelineClip>>(emptyList())
@@ -42,6 +55,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _aspectRatio = MutableStateFlow(AspectRatio.TIKTOK_9_16)
     val aspectRatio: StateFlow<AspectRatio> = _aspectRatio.asStateFlow()
 
+    private val _canvasBgMode = MutableStateFlow(CanvasBackgroundMode.BLUR)
+    val canvasBgMode: StateFlow<CanvasBackgroundMode> = _canvasBgMode.asStateFlow()
+
     private val _beatMarkers = MutableStateFlow<List<BeatMarker>>(emptyList())
     val beatMarkers: StateFlow<List<BeatMarker>> = _beatMarkers.asStateFlow()
 
@@ -51,12 +67,20 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _subtitles = MutableStateFlow<List<SubtitleEntry>>(emptyList())
     val subtitles: StateFlow<List<SubtitleEntry>> = _subtitles.asStateFlow()
 
+    // --- AI STATUS & FEEDBACK ---
+    private val _isAiProcessing = MutableStateFlow(false)
+    val isAiProcessing: StateFlow<Boolean> = _isAiProcessing.asStateFlow()
+
+    private val _aiStatusMessage = MutableStateFlow<String?>(null)
+    val aiStatusMessage: StateFlow<String?> = _aiStatusMessage.asStateFlow()
+
     // Undo / Redo Stacks
     private val undoStack = mutableListOf<List<TimelineClip>>()
     private val redoStack = mutableListOf<List<TimelineClip>>()
 
-    // Video Playback loop job
     private var videoPlaybackJob: Job? = null
+    private var previewRenderJob: Job? = null
+    private var statusToastJob: Job? = null
 
     // --- AUDIO DAW STATE ---
     private val _audioSelection = MutableStateFlow(WaveformSelection())
@@ -74,6 +98,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _backingFader = MutableStateFlow(1.0f)
     val backingFader: StateFlow<Float> = _backingFader.asStateFlow()
 
+    val eqGainsFlow: StateFlow<FloatArray> = dspProcessor.eqGainsFlow
     val gainReductionDb: StateFlow<Float> = dspProcessor.gainReductionDb
     val isDawPlaying: StateFlow<Boolean> = dspProcessor.isPlaying
     val dawPlaybackMs: StateFlow<Long> = dspProcessor.playbackPositionMs
@@ -91,7 +116,6 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     val exportMessage: StateFlow<String?> = _exportMessage.asStateFlow()
 
     init {
-        // Automatically initialize synthetic media so the user has immediate 1-tap testing
         loadDemoProject()
     }
 
@@ -101,32 +125,76 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         captureEngine.stopRecording()
     }
 
+    fun showStatusToast(message: String) {
+        statusToastJob?.cancel()
+        _aiStatusMessage.value = message
+        statusToastJob = viewModelScope.launch {
+            delay(2800)
+            _aiStatusMessage.value = null
+        }
+    }
+
     fun navigateTo(screenIndex: Int) {
+        if (_isPlayingVideo.value && screenIndex != 1) {
+            pauseVideo()
+        }
+        if (dspProcessor.isPlaying.value && screenIndex != 2) {
+            dspProcessor.stopPlayback()
+        }
         _currentScreen.value = screenIndex
+    }
+
+    fun openVideoStudioWithTool(toolPanel: String?) {
+        _requestedToolPanel.value = toolPanel
+        navigateTo(1)
+    }
+
+    fun consumeRequestedToolPanel() {
+        _requestedToolPanel.value = null
+    }
+
+    fun openAudioDawWithTab(tabIndex: Int) {
+        _requestedDawTab.value = tabIndex
+        navigateTo(2)
+    }
+
+    fun consumeRequestedDawTab() {
+        _requestedDawTab.value = null
+    }
+
+    fun startNewBlankProject() {
+        pauseVideo()
+        pushUndoState()
+        timelineEngine.clearCache()
+        _timelineClips.value = emptyList()
+        _selectedClipId.value = null
+        _playheadMs.value = 0L
+        _subtitles.value = emptyList()
+        _beatMarkers.value = emptyList()
+        updatePreviewFrame(0L)
+        navigateTo(1)
     }
 
     fun loadDemoProject() {
         viewModelScope.launch {
+            timelineEngine.clearCache()
             val demoClips = DemoMediaGenerator.createDemoProject(getApplication())
             pushUndoState()
             _timelineClips.value = demoClips
             _selectedClipId.value = demoClips.firstOrNull()?.id
 
-            // Load synthetic audio into DAW
             val synthAudio = DemoMediaGenerator.generateSyntheticAudioBuffer()
-            dspProcessor.loadBuffer(synthAudio)
+            val synthStereo = DemoMediaGenerator.generateSyntheticStereoBuffer()
+            dspProcessor.loadBuffer(synthAudio, synthStereo)
             _audioBufferData.value = synthAudio
 
-            // Run beat detection for yellow markers
-            val (bpm, beats) = dspProcessor.detectBeats()
+            val (bpm, beats) = dspProcessor.detectBeats(synthAudio)
             _detectedBpm.value = bpm
             _beatMarkers.value = beats
 
-            // Run auto-captions
-            val captions = dspProcessor.generateAutoCaptions()
+            val captions = dspProcessor.generateAutoCaptions(synthAudio)
             _subtitles.value = captions
 
-            // Render initial preview frame
             updatePreviewFrame(0L)
         }
     }
@@ -134,7 +202,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private fun pushUndoState() {
         undoStack.add(_timelineClips.value)
         redoStack.clear()
-        if (undoStack.size > 25) {
+        if (undoStack.size > 30) {
             undoStack.removeAt(0)
         }
     }
@@ -169,21 +237,37 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun playVideo() {
         _isPlayingVideo.value = true
-        // Synchronized audio playback through C++ DSP rack and AudioTrack
+        val totalDur = max(1000L, getTotalDurationMs())
+
+        val mixedAudio = dspProcessor.mixTimelineClipsToMasterPcm(_timelineClips.value, totalDur, applyMasterDsp = false)
+        if (mixedAudio.isNotEmpty()) {
+            dspProcessor.loadBuffer(mixedAudio)
+        }
         dspProcessor.startPlayback(startMs = _playheadMs.value)
 
+        videoPlaybackJob?.cancel()
         videoPlaybackJob = viewModelScope.launch {
-            val frameIntervalMs = 33L // ~30 FPS
-            val totalDur = getTotalDurationMs()
+            val frameIntervalMs = 33L
+            var lastTickTime = System.currentTimeMillis()
 
             while (isActive && _isPlayingVideo.value) {
-                var current = _playheadMs.value + frameIntervalMs
+                val now = System.currentTimeMillis()
+                val elapsed = (now - lastTickTime).coerceIn(16L, 100L)
+                lastTickTime = now
+
+                var current = _playheadMs.value + elapsed
                 if (current >= totalDur) {
                     current = 0L
                     dspProcessor.seekTo(0L)
                 }
                 _playheadMs.value = current
-                updatePreviewFrame(current)
+                val bmp = timelineEngine.renderFrameAt(
+                    playheadMs = current,
+                    clips = _timelineClips.value,
+                    outputWidth = _aspectRatio.value.width / 2,
+                    outputHeight = _aspectRatio.value.height / 2
+                )
+                _currentFrameBitmap.value = bmp
                 delay(frameIntervalMs)
             }
         }
@@ -207,8 +291,112 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Imports an external audio file (MP3, WAV, AAC, M4A, OGG) from device storage,
-     * decodes it into PCM, adds it to the BGM track, and loads it into the DSP engine.
+     * Imports a Video or Image file onto either MAIN_VIDEO or PIP_OVERLAY track.
+     */
+    fun importVisualMedia(uri: Uri, targetTrack: TrackType = TrackType.MAIN_VIDEO) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val context = getApplication<Application>()
+                val mimeType = context.contentResolver.getType(uri) ?: ""
+                var fileName = "Media_${System.currentTimeMillis()}"
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIdx != -1 && cursor.moveToFirst()) {
+                        fileName = cursor.getString(nameIdx) ?: fileName
+                    }
+                }
+
+                val safeName = fileName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")
+                val cacheFile = File(context.cacheDir, "media_${System.currentTimeMillis()}_$safeName")
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(cacheFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                val isVideo = mimeType.startsWith("video/") ||
+                        safeName.endsWith(".mp4", true) ||
+                        safeName.endsWith(".mov", true) ||
+                        safeName.endsWith(".mkv", true) ||
+                        safeName.endsWith(".webm", true)
+
+                var durationMs = 4000L
+                var thumbnailBmp: Bitmap? = null
+                var extractedAudio: FloatArray? = null
+                var extractedStereo: FloatArray = FloatArray(0)
+
+                if (isVideo) {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(cacheFile.absolutePath)
+                        val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        durationMs = durStr?.toLongOrNull()?.coerceAtLeast(500L) ?: 5000L
+                        val rawThumb = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        if (rawThumb != null) {
+                            thumbnailBmp = rawThumb.copy(Bitmap.Config.ARGB_8888, false)
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        try { retriever.release() } catch (_: Exception) {}
+                    }
+                    val decodedAudio = AudioDecoder.decodeFile(cacheFile, fileName)
+                    if (decodedAudio.samples.isNotEmpty()) {
+                        extractedAudio = decodedAudio.samples
+                        extractedStereo = decodedAudio.stereoSamples
+                    }
+                } else {
+                    val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
+                    thumbnailBmp = BitmapFactory.decodeFile(cacheFile.absolutePath, opts)
+                    durationMs = 4000L
+                }
+
+                val startMs = if (targetTrack == TrackType.MAIN_VIDEO) {
+                    val lastMainEnd = _timelineClips.value
+                        .filter { it.trackType == TrackType.MAIN_VIDEO }
+                        .maxOfOrNull { it.startOnTimelineMs + it.durationMs } ?: 0L
+                    lastMainEnd
+                } else {
+                    _playheadMs.value
+                }
+
+                val newClip = TimelineClip(
+                    name = fileName,
+                    trackType = targetTrack,
+                    startOnTimelineMs = startMs,
+                    durationMs = durationMs,
+                    sourceDurationMs = durationMs,
+                    isVideoSource = isVideo,
+                    localUri = cacheFile.absolutePath,
+                    thumbnailBitmap = thumbnailBmp,
+                    audioSamples = extractedAudio,
+                    keyframes = if (targetTrack == TrackType.PIP_OVERLAY) {
+                        listOf(Keyframe(timestampMs = startMs, scale = 0.55f, translationY = 180f))
+                    } else emptyList()
+                )
+
+                if (extractedAudio != null && extractedAudio.isNotEmpty()) {
+                    dspProcessor.loadBuffer(extractedAudio, extractedStereo)
+                    _audioBufferData.value = extractedAudio
+                    val (bpm, beats) = dspProcessor.detectBeats(extractedAudio)
+                    _detectedBpm.value = bpm
+                    _beatMarkers.value = beats
+                }
+
+                withContext(Dispatchers.Main) {
+                    pushUndoState()
+                    _timelineClips.value = _timelineClips.value + newClip
+                    _selectedClipId.value = newClip.id
+                    updatePreviewFrame(_playheadMs.value)
+                    showStatusToast("Imported $fileName")
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    /**
+     * Imports an external audio file (MP3, WAV, AAC, M4A, OGG) from device storage.
      */
     fun importAudio(uri: Uri) {
         viewModelScope.launch {
@@ -221,22 +409,23 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         trackType = TrackType.MUSIC_BGM,
                         startOnTimelineMs = _playheadMs.value,
                         durationMs = decoded.durationMs,
+                        sourceDurationMs = decoded.durationMs,
                         localUri = decoded.cachedFilePath,
+                        audioSamples = decoded.samples,
                         volume = 1.0f
                     )
                     _timelineClips.value = _timelineClips.value + newClip
                     _selectedClipId.value = newClip.id
 
-                    // Load decoded PCM buffer into DSP processor for DAW & Video playback
-                    dspProcessor.loadBuffer(decoded.samples)
+                    dspProcessor.loadBuffer(decoded.samples, decoded.stereoSamples)
                     _audioBufferData.value = decoded.samples
 
-                    // Auto-detect beat markers and BPM
-                    val (bpm, beats) = dspProcessor.detectBeats()
+                    val (bpm, beats) = dspProcessor.detectBeats(decoded.samples)
                     _detectedBpm.value = bpm
                     _beatMarkers.value = beats
 
                     updatePreviewFrame(_playheadMs.value)
+                    showStatusToast("Audio imported • ${bpm.toInt()} BPM")
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -244,13 +433,283 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun addOrUpdateTextClip(
+        text: String,
+        fontSizeSp: Float = 28f,
+        textColor: Color = Color(0xFF00E5FF),
+        isKaraoke: Boolean = true,
+        showPill: Boolean = true,
+        editExistingClipId: String? = null
+    ) {
+        if (text.isBlank()) return
+        pushUndoState()
+
+        if (editExistingClipId != null) {
+            _timelineClips.value = _timelineClips.value.map { clip ->
+                if (clip.id == editExistingClipId) {
+                    clip.copy(
+                        name = text.take(18),
+                        textContent = text,
+                        textStyle = clip.textStyle.copy(
+                            fontSizeSp = fontSizeSp,
+                            textColor = textColor,
+                            isKaraokeHighlighted = isKaraoke,
+                            showBackgroundPill = showPill
+                        )
+                    )
+                } else clip
+            }
+        } else {
+            val newTextClip = TimelineClip(
+                name = text.take(18),
+                trackType = TrackType.TEXT_STICKER,
+                startOnTimelineMs = _playheadMs.value,
+                durationMs = 3000L,
+                textContent = text,
+                textStyle = TextStyleSettings(
+                    fontSizeSp = fontSizeSp,
+                    textColor = textColor,
+                    strokeColor = Color.Black,
+                    strokeWidth = 3f,
+                    isKaraokeHighlighted = isKaraoke,
+                    showBackgroundPill = showPill
+                )
+            )
+            _timelineClips.value = _timelineClips.value + newTextClip
+            _selectedClipId.value = newTextClip.id
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    /**
+     * Generates AI Auto-Captions from the active voiceover/video/audio track on the timeline.
+     */
+    fun generateAutoCaptionsToTimeline(recognizedSpeechLines: List<String> = emptyList()) {
+        viewModelScope.launch {
+            _isAiProcessing.value = true
+            try {
+                // Prioritize Voiceover -> Main Video Audio -> BGM -> Active DSP Buffer
+                val sourceClip = _timelineClips.value.firstOrNull {
+                    it.trackType == TrackType.VOICEOVER && it.audioSamples != null && it.audioSamples.isNotEmpty()
+                } ?: _timelineClips.value.firstOrNull {
+                    it.trackType == TrackType.MAIN_VIDEO && it.audioSamples != null && it.audioSamples.isNotEmpty()
+                } ?: _timelineClips.value.firstOrNull {
+                    it.audioSamples != null && it.audioSamples.isNotEmpty()
+                }
+
+                val targetBuffer = sourceClip?.audioSamples ?: dspProcessor.getActiveBuffer()
+                val clipStartOffset = sourceClip?.startOnTimelineMs ?: 0L
+
+                val captions = dspProcessor.generateAutoCaptions(targetBuffer, recognizedSpeechLines)
+                _subtitles.value = captions
+                if (captions.isEmpty()) {
+                    showStatusToast("No speech phrases detected in audio")
+                    return@launch
+                }
+
+                pushUndoState()
+                val captionClips = captions.mapIndexed { idx, entry ->
+                    TimelineClip(
+                        name = entry.text.take(18),
+                        trackType = TrackType.TEXT_STICKER,
+                        startOnTimelineMs = clipStartOffset + entry.startMs,
+                        durationMs = max(500L, entry.endMs - entry.startMs),
+                        textContent = entry.text,
+                        textStyle = TextStyleSettings(
+                            fontSizeSp = 26f,
+                            textColor = if (idx % 2 == 0) Color(0xFF00E5FF) else Color(0xFFFFD600),
+                            strokeColor = Color.Black,
+                            strokeWidth = 3f,
+                            isKaraokeHighlighted = true
+                        )
+                    )
+                }
+                val filtered = _timelineClips.value.filterNot { it.trackType == TrackType.TEXT_STICKER }
+                _timelineClips.value = filtered + captionClips
+                _selectedClipId.value = captionClips.firstOrNull()?.id
+                updatePreviewFrame(_playheadMs.value)
+                showStatusToast("AI Auto-Captions generated (${captionClips.size} segments)")
+            } finally {
+                _isAiProcessing.value = false
+            }
+        }
+    }
+
     fun selectClip(clipId: String?) {
         _selectedClipId.value = clipId
+        if (clipId != null) {
+            val clip = _timelineClips.value.firstOrNull { it.id == clipId }
+            if (clip?.audioSamples != null && clip.audioSamples.isNotEmpty()) {
+                dspProcessor.loadBuffer(clip.audioSamples)
+                _audioBufferData.value = clip.audioSamples
+            }
+        }
+    }
+
+    /**
+     * Magnetic snapping helper: snaps timeMs to Playhead or nearest Beat Marker if within 55ms.
+     */
+    private fun snapTimeMs(rawMs: Long): Long {
+        val snapThresholdMs = 55L
+        val clamped = rawMs.coerceAtLeast(0L)
+        if (abs(clamped - _playheadMs.value) <= snapThresholdMs) {
+            return _playheadMs.value
+        }
+        for (beat in _beatMarkers.value) {
+            if (abs(clamped - beat.timestampMs) <= snapThresholdMs) {
+                return beat.timestampMs
+            }
+        }
+        return clamped
+    }
+
+    fun moveClipStart(clipId: String, newStartMs: Long) {
+        val snappedStart = snapTimeMs(newStartMs)
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == clipId) it.copy(startOnTimelineMs = snappedStart) else it
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    /**
+     * Trims the left (start) edge of a clip on the timeline (CapCut left handle drag).
+     */
+    fun trimClipStart(clipId: String, newStartMs: Long) {
+        _timelineClips.value = _timelineClips.value.map { clip ->
+            if (clip.id == clipId) {
+                val endMs = clip.startOnTimelineMs + clip.durationMs
+                val clampedNewStart = snapTimeMs(newStartMs).coerceIn(0L, max(0L, endMs - 300L))
+                val deltaMs = clampedNewStart - clip.startOnTimelineMs
+                val newDuration = (endMs - clampedNewStart).coerceAtLeast(300L)
+                val newSourceOffset = (clip.sourceOffsetMs + (deltaMs * clip.speed).toLong()).coerceAtLeast(0L)
+                clip.copy(
+                    startOnTimelineMs = clampedNewStart,
+                    durationMs = newDuration,
+                    sourceOffsetMs = newSourceOffset
+                )
+            } else clip
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    /**
+     * Trims the right (end) edge of a clip on the timeline (CapCut right handle drag).
+     */
+    fun trimClipEnd(clipId: String, newDurationMs: Long) {
+        _timelineClips.value = _timelineClips.value.map { clip ->
+            if (clip.id == clipId) {
+                val rawEndMs = clip.startOnTimelineMs + newDurationMs.coerceAtLeast(300L)
+                val snappedEndMs = snapTimeMs(rawEndMs)
+                val maxDur = if (clip.isVideoSource || clip.audioSamples != null) {
+                    max(3000L, ((clip.sourceDurationMs - clip.sourceOffsetMs) / clip.speed).toLong())
+                } else 30000L
+                val finalDuration = (snappedEndMs - clip.startOnTimelineMs).coerceIn(300L, maxDur)
+                clip.copy(durationMs = finalDuration)
+            } else clip
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    /**
+     * Interactive touch gesture manipulation directly on the Video Canvas Preview.
+     */
+    fun transformSelectedClipOnCanvas(
+        panX: Float,
+        panY: Float,
+        zoomChange: Float,
+        rotationChange: Float,
+        canvasBoxWidth: Float,
+        canvasBoxHeight: Float
+    ) {
+        val selId = _selectedClipId.value ?: return
+        val clip = _timelineClips.value.firstOrNull { it.id == selId } ?: return
+        if (canvasBoxWidth <= 10f || canvasBoxHeight <= 10f) return
+
+        if (clip.trackType == TrackType.TEXT_STICKER) {
+            val newXRatio = (clip.textStyle.positionXRatio + (panX / canvasBoxWidth)).coerceIn(0.08f, 0.92f)
+            val newYRatio = (clip.textStyle.positionYRatio + (panY / canvasBoxHeight)).coerceIn(0.08f, 0.92f)
+            val newFontSize = (clip.textStyle.fontSizeSp * zoomChange).coerceIn(12f, 72f)
+            _timelineClips.value = _timelineClips.value.map {
+                if (it.id == selId) {
+                    it.copy(
+                        textStyle = it.textStyle.copy(
+                            positionXRatio = newXRatio,
+                            positionYRatio = newYRatio,
+                            fontSizeSp = newFontSize
+                        )
+                    )
+                } else it
+            }
+        } else {
+            val currentKf = timelineEngine.interpolateKeyframe(clip, _playheadMs.value)
+            val dx1080 = (panX / canvasBoxWidth) * 1080f
+            val dy1920 = (panY / canvasBoxHeight) * 1920f
+            val newScale = (currentKf.scale * zoomChange).coerceIn(0.2f, 3.0f)
+            val newRot = (currentKf.rotationDegrees + rotationChange) % 360f
+            addOrUpdateKeyframeAtPlayhead(
+                scale = newScale,
+                translationX = (currentKf.translationX + dx1080).coerceIn(-600f, 600f),
+                translationY = (currentKf.translationY + dy1920).coerceIn(-900f, 900f),
+                rotationDegrees = newRot,
+                opacity = currentKf.opacity,
+                recordUndo = false
+            )
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    fun updateClipVolume(volume: Float, isMuted: Boolean) {
+        val selId = _selectedClipId.value ?: return
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == selId) it.copy(volume = volume.coerceIn(0f, 2f), isMuted = isMuted) else it
+        }
+    }
+
+    fun toggleClipStabilization() {
+        val selId = _selectedClipId.value ?: return
+        pushUndoState()
+        var nowStabilized = false
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == selId) {
+                nowStabilized = !it.isStabilized
+                it.copy(isStabilized = nowStabilized)
+            } else it
+        }
+        updatePreviewFrame(_playheadMs.value)
+        showStatusToast(if (nowStabilized) "AI Motion Stabilization Enabled" else "Motion Stabilization Off")
+    }
+
+    fun toggleClipMirror() {
+        val selId = _selectedClipId.value ?: return
+        pushUndoState()
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == selId) it.copy(isMirrored = !it.isMirrored) else it
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    fun rotateClip90() {
+        val selId = _selectedClipId.value ?: return
+        val clip = _timelineClips.value.firstOrNull { it.id == selId } ?: return
+        val kf = timelineEngine.interpolateKeyframe(clip, _playheadMs.value)
+        addOrUpdateKeyframeAtPlayhead(
+            scale = kf.scale,
+            translationX = kf.translationX,
+            translationY = kf.translationY,
+            rotationDegrees = (kf.rotationDegrees + 90f) % 360f,
+            opacity = kf.opacity
+        )
     }
 
     fun setAspectRatio(ratio: AspectRatio) {
         _aspectRatio.value = ratio
         timelineEngine.currentAspectRatio = ratio
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    fun setCanvasBackgroundMode(mode: CanvasBackgroundMode) {
+        _canvasBgMode.value = mode
+        timelineEngine.canvasBackgroundMode = mode
         updatePreviewFrame(_playheadMs.value)
     }
 
@@ -264,11 +723,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun updatePreviewFrame(timestampMs: Long) {
-        viewModelScope.launch {
+        previewRenderJob?.cancel()
+        previewRenderJob = viewModelScope.launch {
             val bmp = timelineEngine.renderFrameAt(
                 playheadMs = timestampMs,
                 clips = _timelineClips.value,
-                outputWidth = _aspectRatio.value.width / 2, // Scaled down for 60fps smooth UI canvas
+                outputWidth = _aspectRatio.value.width / 2,
                 outputHeight = _aspectRatio.value.height / 2
             )
             _currentFrameBitmap.value = bmp
@@ -311,8 +771,27 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _timelineClips.value = _timelineClips.value.map {
             if (it.id == selId) {
                 val newDuration = ((it.sourceDurationMs).toFloat() / speed).toLong()
-                it.copy(speed = speed, durationMs = max(100L, newDuration))
+                it.copy(speed = speed, durationMs = max(200L, newDuration))
             } else it
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    fun setClipSpeedCurve(curve: SpeedCurvePreset) {
+        val selId = _selectedClipId.value ?: return
+        pushUndoState()
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == selId) it.copy(speedCurve = curve) else it
+        }
+        updatePreviewFrame(_playheadMs.value)
+        showStatusToast("Speed Curve: ${curve.title}")
+    }
+
+    fun setClipAnimation(animation: ClipAnimationType) {
+        val selId = _selectedClipId.value ?: return
+        pushUndoState()
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == selId) it.copy(animationType = animation) else it
         }
         updatePreviewFrame(_playheadMs.value)
     }
@@ -323,14 +802,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _timelineClips.value = _timelineClips.value.map {
             if (it.id == selId) it.copy(isReversed = !it.isReversed) else it
         }
+        updatePreviewFrame(_playheadMs.value)
     }
 
     fun freezeFrameAtPlayhead() {
-        val selId = _selectedClipId.value ?: return
         val currentBmp = _currentFrameBitmap.value ?: return
         pushUndoState()
 
-        val freezeDuration = 3000L
+        val freezeDuration = 2500L
         val freezeClip = TimelineClip(
             name = "Freeze Frame",
             trackType = TrackType.MAIN_VIDEO,
@@ -340,25 +819,50 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             isFreezeFrame = true
         )
 
-        // Shift subsequent clips
         val shifted = _timelineClips.value.map {
-            if (it.startOnTimelineMs >= _playheadMs.value) {
+            if (it.trackType == TrackType.MAIN_VIDEO && it.startOnTimelineMs >= _playheadMs.value) {
                 it.copy(startOnTimelineMs = it.startOnTimelineMs + freezeDuration)
             } else it
         }
         _timelineClips.value = shifted + freezeClip
+        _selectedClipId.value = freezeClip.id
         updatePreviewFrame(_playheadMs.value)
     }
 
-    fun addKeyframeAtPlayhead() {
+    fun addOrUpdateKeyframeAtPlayhead(
+        scale: Float = 1.15f,
+        translationX: Float = 0f,
+        translationY: Float = 0f,
+        rotationDegrees: Float = 0f,
+        opacity: Float = 1.0f,
+        recordUndo: Boolean = true
+    ) {
         val selId = _selectedClipId.value ?: return
-        pushUndoState()
+        if (recordUndo) pushUndoState()
         _timelineClips.value = _timelineClips.value.map { clip ->
             if (clip.id == selId) {
-                val newKf = Keyframe(timestampMs = _playheadMs.value, scale = 1.15f, rotationDegrees = 5f)
-                val updatedKfs = (clip.keyframes + newKf).sortedBy { it.timestampMs }
+                val nowMs = _playheadMs.value
+                val filtered = clip.keyframes.filterNot { abs(it.timestampMs - nowMs) < 100L }
+                val newKf = Keyframe(
+                    timestampMs = nowMs,
+                    scale = scale,
+                    translationX = translationX,
+                    translationY = translationY,
+                    rotationDegrees = rotationDegrees,
+                    opacity = opacity
+                )
+                val updatedKfs = (filtered + newKf).sortedBy { it.timestampMs }
                 clip.copy(keyframes = updatedKfs)
             } else clip
+        }
+        updatePreviewFrame(_playheadMs.value)
+    }
+
+    fun clearClipKeyframes() {
+        val selId = _selectedClipId.value ?: return
+        pushUndoState()
+        _timelineClips.value = _timelineClips.value.map {
+            if (it.id == selId) it.copy(keyframes = emptyList()) else it
         }
         updatePreviewFrame(_playheadMs.value)
     }
@@ -379,6 +883,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         updatePreviewFrame(_playheadMs.value)
     }
 
+    fun autoSampleChromaKeyColor() {
+        val selId = _selectedClipId.value ?: return
+        val clip = _timelineClips.value.firstOrNull { it.id == selId } ?: return
+        viewModelScope.launch {
+            val sampledRgb = timelineEngine.sampleDominantBorderColor(clip, _playheadMs.value)
+            val updatedChroma = clip.chromaKey.copy(enabled = true, keyColor = sampledRgb)
+            updateChromaKey(updatedChroma)
+            showStatusToast("Sampled background key color")
+        }
+    }
+
     fun setTransition(transition: TransitionType) {
         val selId = _selectedClipId.value ?: return
         _timelineClips.value = _timelineClips.value.map {
@@ -390,30 +905,76 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun extractAudioFromActiveClip() {
         val selId = _selectedClipId.value ?: return
         val clip = _timelineClips.value.firstOrNull { it.id == selId } ?: return
-        pushUndoState()
+        viewModelScope.launch {
+            var samples = clip.audioSamples
+            if (samples == null && clip.localUri.isNotEmpty()) {
+                val decoded = AudioDecoder.decodeFile(File(clip.localUri), clip.name)
+                if (decoded.samples.isNotEmpty()) {
+                    samples = decoded.samples
+                }
+            }
+            if (samples == null || samples.isEmpty()) {
+                samples = dspProcessor.getActiveBuffer()
+            }
 
-        val extractedAudioClip = TimelineClip(
-            name = "Audio (${clip.name})",
-            trackType = TrackType.MUSIC_BGM,
-            startOnTimelineMs = clip.startOnTimelineMs,
-            durationMs = clip.durationMs,
-            localUri = clip.localUri,
-            volume = 1.0f
-        )
-        _timelineClips.value = _timelineClips.value + extractedAudioClip
+            pushUndoState()
+            val extractedAudioClip = TimelineClip(
+                name = "Audio (${clip.name})",
+                trackType = TrackType.MUSIC_BGM,
+                startOnTimelineMs = clip.startOnTimelineMs,
+                durationMs = clip.durationMs,
+                localUri = clip.localUri,
+                audioSamples = samples,
+                volume = 1.0f
+            )
+            _timelineClips.value = _timelineClips.value + extractedAudioClip
+            _selectedClipId.value = extractedAudioClip.id
+            showStatusToast("Audio extracted to BGM track")
+        }
+    }
+
+    fun detectBeatsOnTimeline() {
+        viewModelScope.launch {
+            _isAiProcessing.value = true
+            try {
+                val selClip = _timelineClips.value.firstOrNull { it.id == _selectedClipId.value }
+                val audioToAnalyze = if (selClip?.audioSamples != null && selClip.audioSamples.isNotEmpty()) {
+                    selClip.audioSamples
+                } else {
+                    val totalDur = max(1000L, getTotalDurationMs())
+                    dspProcessor.mixTimelineClipsToMasterPcm(_timelineClips.value, totalDur, applyMasterDsp = false)
+                }
+
+                val (bpm, beats) = dspProcessor.detectBeats(audioToAnalyze)
+                _detectedBpm.value = bpm
+                _beatMarkers.value = beats
+                showStatusToast("Auto-Beat Sync: ${bpm.toInt()} BPM (${beats.size} beats)")
+            } finally {
+                _isAiProcessing.value = false
+            }
+        }
     }
 
     fun startLiveVoiceover() {
+        val recordStartMs = _playheadMs.value
         captureEngine.startRecording { buffer, file ->
-            val voClip = TimelineClip(
-                name = "Live Mic Take",
-                trackType = TrackType.VOICEOVER,
-                startOnTimelineMs = _playheadMs.value,
-                durationMs = (buffer.size * 1000L) / 44100,
-                localUri = file.absolutePath,
-                volume = 1.0f
-            )
-            _timelineClips.value = _timelineClips.value + voClip
+            if (buffer.isNotEmpty()) {
+                pushUndoState()
+                val voClip = TimelineClip(
+                    name = "Voiceover (${(buffer.size / 44100).coerceAtLeast(1)}s)",
+                    trackType = TrackType.VOICEOVER,
+                    startOnTimelineMs = recordStartMs,
+                    durationMs = max(500L, (buffer.size * 1000L) / 44100),
+                    localUri = file.absolutePath,
+                    audioSamples = buffer,
+                    volume = 1.0f
+                )
+                _timelineClips.value = _timelineClips.value + voClip
+                _selectedClipId.value = voClip.id
+                dspProcessor.loadBuffer(buffer)
+                _audioBufferData.value = buffer
+                showStatusToast("Voiceover recorded to timeline")
+            }
         }
     }
 
@@ -421,7 +982,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         captureEngine.stopRecording()
     }
 
-    // --- AUDIO DAW CONTROLS ---
+    // --- AUDIO DAW & AI AUDIO CONTROLS ---
 
     fun toggleDawPlayback() {
         if (dspProcessor.isPlaying.value) {
@@ -443,11 +1004,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _audioSelection.value = WaveformSelection()
     }
 
+    private fun syncActiveDawBufferToSelectedClip(updatedBuffer: FloatArray) {
+        _audioBufferData.value = updatedBuffer.copyOf()
+        val selId = _selectedClipId.value ?: return
+        _timelineClips.value = _timelineClips.value.map { clip ->
+            if (clip.id == selId && clip.audioSamples != null) {
+                val newDurMs = max(300L, (updatedBuffer.size.toLong() * 1000L) / dspProcessor.sampleRate)
+                clip.copy(audioSamples = updatedBuffer.copyOf(), durationMs = newDurMs)
+            } else clip
+        }
+    }
+
     fun trimAudioSelection() {
         val sel = _audioSelection.value
         if (!sel.isActive || sel.endMs <= sel.startMs) return
         val trimmed = dspProcessor.trimSelection(sel.startMs, sel.endMs)
-        _audioBufferData.value = trimmed
+        syncActiveDawBufferToSelectedClip(trimmed)
         clearAudioSelection()
     }
 
@@ -455,7 +1027,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val sel = _audioSelection.value
         if (!sel.isActive || sel.endMs <= sel.startMs) return
         val cut = dspProcessor.cutMiddleAndStitch(sel.startMs, sel.endMs)
-        _audioBufferData.value = cut
+        syncActiveDawBufferToSelectedClip(cut)
         clearAudioSelection()
     }
 
@@ -463,27 +1035,28 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val sel = _audioSelection.value
         if (!sel.isActive || sel.endMs <= sel.startMs) return
         val silenced = dspProcessor.silenceRegion(sel.startMs, sel.endMs)
-        _audioBufferData.value = silenced.copyOf()
+        syncActiveDawBufferToSelectedClip(silenced)
     }
 
     fun normalizeAudio(peakDb: Float = 0f) {
         val norm = dspProcessor.normalize(peakDb)
-        _audioBufferData.value = norm.copyOf()
+        syncActiveDawBufferToSelectedClip(norm)
+        showStatusToast("Normalized audio to ${peakDb.toInt()} dB")
     }
 
     fun fadeInAudio() {
         val faded = dspProcessor.fadeIn(1500L)
-        _audioBufferData.value = faded.copyOf()
+        syncActiveDawBufferToSelectedClip(faded)
     }
 
     fun fadeOutAudio() {
         val faded = dspProcessor.fadeOut(1500L)
-        _audioBufferData.value = faded.copyOf()
+        syncActiveDawBufferToSelectedClip(faded)
     }
 
     fun reverseAudio() {
         val rev = dspProcessor.reverseAudio()
-        _audioBufferData.value = rev.copyOf()
+        syncActiveDawBufferToSelectedClip(rev)
     }
 
     fun setEqGain(band: Int, gainDb: Float) {
@@ -504,20 +1077,70 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setVoicePreset(presetId: Int) {
         dspProcessor.setVoicePreset(presetId)
+        val selId = _selectedClipId.value
+        if (selId != null) {
+            _timelineClips.value = _timelineClips.value.map {
+                if (it.id == selId) it.copy(voicePresetId = presetId) else it
+            }
+        }
     }
 
     fun applyAiDenoise() {
         viewModelScope.launch {
-            val denoised = dspProcessor.applyAiStudioDenoise(18f)
-            _audioBufferData.value = denoised.copyOf()
+            _isAiProcessing.value = true
+            try {
+                val selId = _selectedClipId.value
+                val selClip = _timelineClips.value.firstOrNull { it.id == selId }
+                if (selClip?.audioSamples != null && selClip.audioSamples.isNotEmpty()) {
+                    val denoisedClipPcm = dspProcessor.denoiseBuffer(selClip.audioSamples, 18f)
+                    pushUndoState()
+                    _timelineClips.value = _timelineClips.value.map {
+                        if (it.id == selId) it.copy(audioSamples = denoisedClipPcm, isAiDenoised = true) else it
+                    }
+                    dspProcessor.loadBuffer(denoisedClipPcm)
+                    _audioBufferData.value = denoisedClipPcm.copyOf()
+                } else {
+                    val denoised = dspProcessor.applyAiStudioDenoise(18f)
+                    _audioBufferData.value = denoised.copyOf()
+                }
+                showStatusToast("AI Noise Reduction applied (-18 dB)")
+            } finally {
+                _isAiProcessing.value = false
+            }
         }
     }
 
     fun runStemSeparation() {
         viewModelScope.launch {
-            val result = dspProcessor.splitStems()
-            _stemSplitResult.value = result
+            _isAiProcessing.value = true
+            try {
+                val result = dspProcessor.splitStems()
+                _stemSplitResult.value = result
+                showStatusToast("AI 2-Stem Separation complete")
+            } finally {
+                _isAiProcessing.value = false
+            }
         }
+    }
+
+    fun sendSeparatedStemToTimeline(useVocals: Boolean) {
+        val stems = _stemSplitResult.value ?: return
+        val buffer = if (useVocals) stems.vocalBuffer else stems.backingBuffer
+        if (buffer.isEmpty()) return
+        pushUndoState()
+        val durationMs = max(500L, (buffer.size.toLong() * 1000L) / stems.sampleRate)
+        val stemClip = TimelineClip(
+            name = if (useVocals) "AI Stem: Lead Vocals" else "AI Stem: Instrumental",
+            trackType = if (useVocals) TrackType.VOICEOVER else TrackType.MUSIC_BGM,
+            startOnTimelineMs = 0L,
+            durationMs = durationMs,
+            sourceDurationMs = durationMs,
+            audioSamples = buffer.copyOf(),
+            volume = 1.0f
+        )
+        _timelineClips.value = _timelineClips.value + stemClip
+        _selectedClipId.value = stemClip.id
+        showStatusToast("${stemClip.name} added to timeline")
     }
 
     fun setVocalStemFader(vol: Float) {
@@ -552,26 +1175,32 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         quality: BitrateQuality = BitrateQuality.RECOMMENDED
     ) {
         if (_isExporting.value) return
+        pauseVideo()
         _isExporting.value = true
         _exportProgress.value = 0f
-        _exportMessage.value = "Encoding Video (${res.label}, ${fps.fps} FPS)..."
+        _exportMessage.value = "Encoding Video + Master Audio (${res.label}, ${fps.fps} FPS)..."
 
         viewModelScope.launch {
             try {
+                val totalDur = max(1000L, getTotalDurationMs())
+                val masterPcm = dspProcessor.mixTimelineClipsToMasterPcm(_timelineClips.value, totalDur)
+
                 val outputLocation = exportEngine.exportVideo(
                     clips = _timelineClips.value,
                     timelineEngine = timelineEngine,
+                    masterAudioPcm = masterPcm,
+                    sampleRate = dspProcessor.sampleRate,
                     resolution = res,
                     frameRate = fps,
                     bitrateQuality = quality
                 ) { progress ->
                     _exportProgress.value = progress
                 }
-                _exportMessage.value = "Success! $outputLocation"
+                _exportMessage.value = "Saved: $outputLocation"
             } catch (e: Exception) {
-                _exportMessage.value = "Export error: ${e.message}"
+                _exportMessage.value = "Export failed: ${e.message}"
             } finally {
-                delay(3000)
+                delay(2200)
                 _isExporting.value = false
             }
         }
@@ -579,21 +1208,22 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun exportAudio(format: AudioExportFormat = AudioExportFormat.LOSSLESS_WAV) {
         if (_isExporting.value) return
+        dspProcessor.stopPlayback()
         _isExporting.value = true
         _exportProgress.value = 0f
-        _exportMessage.value = "Exporting Master Audio (${if (format == AudioExportFormat.LOSSLESS_WAV) "WAV Lossless" else "M4A AAC"})..."
+        _exportMessage.value = "Exporting Audio (${if (format == AudioExportFormat.LOSSLESS_WAV) "WAV Lossless" else "M4A AAC"})..."
 
         viewModelScope.launch {
             try {
-                val buffer = dspProcessor.getActiveBuffer()
-                val path = exportEngine.exportAudio(buffer, dspProcessor.sampleRate, format) {
+                val processedBuffer = dspProcessor.renderProcessedBuffer()
+                val path = exportEngine.exportAudio(processedBuffer, dspProcessor.sampleRate, format) {
                     _exportProgress.value = it
                 }
-                _exportMessage.value = "Success! $path"
+                _exportMessage.value = "Saved: $path"
             } catch (e: Exception) {
-                _exportMessage.value = "Export error: ${e.message}"
+                _exportMessage.value = "Export failed: ${e.message}"
             } finally {
-                delay(3000)
+                delay(2200)
                 _isExporting.value = false
             }
         }

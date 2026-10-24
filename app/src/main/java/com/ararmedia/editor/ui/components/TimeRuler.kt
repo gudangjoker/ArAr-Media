@@ -2,6 +2,7 @@ package com.ararmedia.editor.ui.components
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.Composable
@@ -30,9 +31,17 @@ fun TimeRuler(
     Canvas(
         modifier = modifier
             .fillMaxWidth()
-            .height(38.dp)
+            .height(34.dp)
+            .pointerInput(zoomScale, scrollOffsetPx) {
+                detectTapGestures { offset ->
+                    val clickedPx = offset.x + scrollOffsetPx
+                    val timeMs = ((clickedPx / zoomScale) * 1000L).toLong()
+                    onSeek(timeMs.coerceAtLeast(0L))
+                }
+            }
             .pointerInput(zoomScale, scrollOffsetPx) {
                 detectDragGestures { change, _ ->
+                    change.consume()
                     val clickedPx = change.position.x + scrollOffsetPx
                     val timeMs = ((clickedPx / zoomScale) * 1000L).toLong()
                     onSeek(timeMs.coerceAtLeast(0L))
@@ -42,7 +51,6 @@ fun TimeRuler(
         val width = size.width
         val height = size.height
 
-        // Background
         drawRect(Color(0xFF141622))
 
         val startVisibleMs = ((scrollOffsetPx / zoomScale) * 1000L).toLong().coerceAtLeast(0L)
@@ -52,20 +60,19 @@ fun TimeRuler(
         for (beat in beatMarkers) {
             if (beat.timestampMs in startVisibleMs..endVisibleMs) {
                 val beatX = (beat.timestampMs / 1000f) * zoomScale - scrollOffsetPx
-                drawLine(
+                drawCircle(
                     color = StudioGoldAccent,
-                    start = Offset(beatX, 0f),
-                    end = Offset(beatX, 8f),
-                    strokeWidth = 3f
+                    radius = 4f,
+                    center = Offset(beatX, 6f)
                 )
             }
         }
 
         // 2. Draw second and frame ticks
         val stepMs = when {
-            zoomScale > 150f -> 100L  // Show every 100ms
-            zoomScale > 60f -> 500L   // Show every half second
-            else -> 1000L             // Show every 1s
+            zoomScale > 300f -> 100L
+            zoomScale > 120f -> 500L
+            else -> 1000L
         }
 
         val firstTick = (startVisibleMs / stepMs) * stepMs
@@ -84,7 +91,6 @@ fun TimeRuler(
                 strokeWidth = if (isMajorSecond) 2f else 1f
             )
 
-            // Draw timecode label on major seconds
             if (isMajorSecond && tickX in 0f..width) {
                 val sec = (tickMs / 1000L) % 60
                 val min = (tickMs / 60000L)
@@ -93,17 +99,17 @@ fun TimeRuler(
                 drawIntoCanvas { canvas ->
                     val paint = android.graphics.Paint().apply {
                         color = android.graphics.Color.LTGRAY
-                        textSize = 24f
+                        textSize = 22f
                         isAntiAlias = true
                     }
-                    canvas.nativeCanvas.drawText(label, tickX + 4f, 26f, paint)
+                    canvas.nativeCanvas.drawText(label, tickX + 4f, 22f, paint)
                 }
             }
 
             tickMs += stepMs
         }
 
-        // 3. Draw red playhead line
+        // 3. Draw playhead line
         val playheadX = (currentPlayheadMs / 1000f) * zoomScale - scrollOffsetPx
         if (playheadX in 0f..width) {
             drawLine(
