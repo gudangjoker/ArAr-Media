@@ -24,49 +24,65 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Generate Release Signing Keystore
+      - name: Verify Persistent Release Keystore
         run: |
-          keytool -genkeypair -v \
-            -keystore ${{ github.workspace }}/release-keystore.jks \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -alias ararmedia \
-            -storepass ararmedia123 \
-            -keypass ararmedia123 \
-            -dname "CN=ArAr Media, OU=Development, O=ArArMedia, L=Jakarta, S=DKI, C=ID"
+          if [ ! -f "${{ github.workspace }}/app/release-keystore.jks" ]; then
+            keytool -genkeypair -v \
+              -keystore ${{ github.workspace }}/app/release-keystore.jks \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -alias ararmedia \
+              -storepass ararmedia123 \
+              -keypass ararmedia123 \
+              -dname "CN=ArAr Media, OU=Development, O=ArArMedia, L=Jakarta, S=DKI, C=ID"
+          fi
 
       - name: Grant Execute Permission to Gradlew
         run: chmod +x gradlew
 
-      - name: Build Signed Release APK with Native C++ Engine
+      - name: Build Signed Release APK with Native C++ & Bundled AI Engines
         env:
-          RELEASE_STORE_FILE: ${{ github.workspace }}/release-keystore.jks
+          RELEASE_STORE_FILE: ${{ github.workspace }}/app/release-keystore.jks
           RELEASE_STORE_PASSWORD: ararmedia123
           RELEASE_KEY_ALIAS: ararmedia
           RELEASE_KEY_PASSWORD: ararmedia123
         run: |
           ./gradlew assembleRelease --stacktrace
-          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/ArAr-Media-v1.0.0-release.apk
+          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/ArAr-Media-v1.0.1-release.apk
 
       - name: Upload Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ArAr-Media-Release-APK
-          path: app/build/outputs/apk/release/ArAr-Media-v1.0.0-release.apk
+          name: ArAr-Media-v1.0.1-Release-APK
+          path: app/build/outputs/apk/release/ArAr-Media-v1.0.1-release.apk
           if-no-files-found: error
           retention-days: 30
 
       - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: ArAr Media v1.0.0 (Release APK)
+          tag_name: v1.0.1
+          name: ArAr Media v1.0.1 (Release APK)
           body: |
-            ### ArAr Media v1.0.0 — Editor Video & Audio Lokal (Android)
-            Build rilis otomatis (`arm64-v8a` & `x86_64`) dengan engine C++17 NDK (`libarar_media_engine.so`).
+            ### ArAr Media v1.0.1 — Rekonstruksi Engine Sinkronisasi A/V, Disk-Backed PCM & Bundled On-Device AI
+            Build rilis otomatis (`arm64-v8a` & `x86_64`) dengan engine C++17 NDK (`libarar_media_engine.so`) serta model AI visi terbundel.
+
+            **Pembaruan Utama di v1.0.1:**
+            - **Zero-Drift Hardware Audio Master Clock**: Sinkronisasi pemutaran video dan audio dikunci langsung ke posisi sampel perangkat keras (`AudioTrack.getPlaybackHeadPosition()`) dengan streaming audio *real-time* (0ms *pre-mix delay*) dan kumpulan `MediaMetadataRetriever` persisten.
+            - **Disk-Backed 16-bit PCM Cache (`.pcm16`)**: Mendukung durasi audio/video hingga 25 menit tanpa batas RAM 3 menit serta pratinjau gelombang suara 512-titik (`waveformPeaks`).
+            - **Bundled Neural AI & DSP Engines**:
+              - *AI Smart Cutout*: Model **Google ML Kit Selfie Segmentation** terbundel + *guided bilinear alpha feathering* C++.
+              - *AI Auto-Reframe (9:16 Face Tracking)*: Pelacakan wajah otomatis berbasis **Google ML Kit Face Detection** terbundel.
+              - *AI Face Retouch & Portrait Relight*: Penghalusan kulit *edge-preserving bilateral filter* 5x5 & *portrait relight* C++.
+              - *AI Smart Scene Cut Detection*: Deteksi pergantian adegan berbasis histogram *Chi-Square* 64-bin & *luma flux* C++.
+              - *AI Denoise (RNNoise 22-Bark-Band GRU)* & *AI Voice Enhancer + WPE Dereverb*.
+              - *AI 2-Stem Separation*: 2048-point 75%-Overlap STFT + 2D Median HPSS + Vocal Formant Prior.
+              - *Auto-Captions (ID/EN)*: Transkripsi *audio-pipe* `SpeechRecognizer` (`EXTRA_AUDIO_SOURCE` pada Android 13+) dengan cadangan analisis prosodi akustik.
+            - **Penyimpanan Draf Proyek Otomatis**: Auto-save proyek ke JSON lokal (`ProjectPersistenceManager`) lengkap dengan manajemen draf di halaman utama.
+            - **Perbaikan Ikon & Adaptive Launcher Icon**: Simbol utama diposisikan presisi di tengah tanpa sudut putih dan mendukung *Adaptive Icon* Android 8.0+.
 
             **Isi Paket:**
-            - `ArAr-Media-v1.0.0-release.apk` (Sudah ditandatangani / signed, siap dipasang di Android 8.0+)
-          files: app/build/outputs/apk/release/ArAr-Media-v1.0.0-release.apk
+            - `ArAr-Media-v1.0.1-release.apk` (Ditandatangani dengan `app/release-keystore.jks` permanen)
+          files: app/build/outputs/apk/release/ArAr-Media-v1.0.1-release.apk
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -78,7 +78,9 @@ data class ColorGrading(
     val temperature: Float = 0f,     // -50 (cool) to 50 (warm)
     val sharpness: Float = 0f,       // 0 to 100
     val vignette: Float = 0f,        // 0 to 100
-    val lut: LutPreset = LutPreset.NONE
+    val lut: LutPreset = LutPreset.NONE,
+    val skinSmooth: Float = 0f,      // 0 to 100 (AI Face Retouch)
+    val faceRelight: Float = 0f      // 0 to 100 (AI Portrait Relight)
 )
 
 data class Keyframe(
@@ -117,6 +119,8 @@ data class TimelineClip(
     val isVideoSource: Boolean = false,
     val isStabilized: Boolean = false,
     val isAiDenoised: Boolean = false,
+    val isVoiceEnhanced: Boolean = false,
+    val isAutoReframed: Boolean = false,
     val voicePresetId: Int = 0,
     val volume: Float = 1.0f,
     val isMuted: Boolean = false,
@@ -130,8 +134,10 @@ data class TimelineClip(
     // For text & sticker clips:
     val textContent: String = "",
     val textStyle: TextStyleSettings = TextStyleSettings(),
-    // Content source & cached audio PCM
+    // Content source & disk-backed cached audio PCM
     val localUri: String = "",
+    val pcmCachePath: String = "",
+    val waveformPeaks: FloatArray = FloatArray(0),
     val thumbnailBitmap: Bitmap? = null,
     val audioSamples: FloatArray? = null
 )

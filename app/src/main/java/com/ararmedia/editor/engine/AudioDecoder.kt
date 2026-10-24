@@ -8,11 +8,15 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Arrays
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -20,16 +24,123 @@ data class DecodedAudio(
     val fileName: String,
     val samples: FloatArray,
     val stereoSamples: FloatArray = FloatArray(0),
+    val waveformPeaks: FloatArray = FloatArray(0),
+    val pcmCachePath: String = "",
     val sampleRate: Int = 44100,
     val durationMs: Long,
     val cachedFilePath: String
 )
 
+/**
+ * Primitive growing FloatArray builder to avoid boxing millions of Float objects on the heap.
+ */
+private class PrimitiveFloatBuilder(initialCapacity: Int = 44100 * 15) {
+    var data = FloatArray(initialCapacity)
+        private set
+    var size = 0
+        private set
+
+    fun add(value: Float) {
+        if (size == data.size) {
+            val newCap = max(data.size * 2, size + 44100 * 10)
+            data = Arrays.copyOf(data, newCap)
+        }
+        data[size++] = value
+    }
+
+    fun toFloatArray(): FloatArray = Arrays.copyOf(data, size)
+}
+
 object AudioDecoder {
 
     /**
+     * Computes a compact 512-point peak envelope from a mono PCM buffer for zero-lag timeline waveform drawing.
+     */
+    fun computeWaveformPeaks(samples: FloatArray, numBuckets: Int = 512): FloatArray {
+        if (samples.isEmpty() || numBuckets <= 0) return FloatArray(0)
+        val out = FloatArray(numBuckets)
+        val bucketSize = max(1, samples.size / numBuckets)
+        for (b in 0 until numBuckets) {
+            val start = b * bucketSize
+            val end = min(samples.size, start + bucketSize)
+            var peak = 0f
+            val step = max(1, (end - start) / 16)
+            var i = start
+            while (i < end) {
+                val a = abs(samples[i])
+                if (a > peak) peak = a
+                i += step
+            }
+            out[b] = peak.coerceIn(0.02f, 1.0f)
+        }
+        return out
+    }
+
+    /**
+     * Writes a mono FloatArray PCM buffer to a 16-bit Little-Endian disk cache file (.pcm16)
+     * so long tracks can be streamed from disk with minimal heap footprint.
+     */
+    fun writePcmCacheFile(targetFile: File, samples: FloatArray): String {
+        if (samples.isEmpty()) return ""
+        return try {
+            BufferedOutputStream(FileOutputStream(targetFile), 65536).use { bos ->
+                val chunkBytes = ByteArray(8192)
+                val bb = ByteBuffer.wrap(chunkBytes).order(ByteOrder.LITTLE_ENDIAN)
+                var idx = 0
+                while (idx < samples.size) {
+                    bb.clear()
+                    val count = min(4096, samples.size - idx)
+                    for (i in 0 until count) {
+                        val s = (samples[idx + i].coerceIn(-1f, 1f) * 32767f).toInt().toShort()
+                        bb.putShort(s)
+                    }
+                    bos.write(chunkBytes, 0, count * 2)
+                    idx += count
+                }
+            }
+            targetFile.absolutePath
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    /**
+     * Reads a window of mono PCM samples from a disk-backed .pcm16 cache file into [outBuffer].
+     */
+    fun readPcmWindowFromDisk(
+        pcmCachePath: String,
+        startSample: Int,
+        count: Int,
+        outBuffer: FloatArray
+    ): Int {
+        if (pcmCachePath.isEmpty() || count <= 0) return 0
+        val file = File(pcmCachePath)
+        if (!file.exists()) return 0
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                val totalSamplesInFile = (raf.length() / 2L).toInt()
+                if (startSample >= totalSamplesInFile) return 0
+                val safeStart = startSample.coerceAtLeast(0)
+                val toRead = min(count, totalSamplesInFile - safeStart)
+                raf.seek(safeStart.toLong() * 2L)
+                val byteBuf = ByteArray(toRead * 2)
+                val bytesRead = raf.read(byteBuf)
+                if (bytesRead <= 0) return 0
+                val shortsRead = bytesRead / 2
+                val bb = ByteBuffer.wrap(byteBuf, 0, shortsRead * 2).order(ByteOrder.LITTLE_ENDIAN)
+                for (i in 0 until shortsRead) {
+                    outBuffer[i] = (bb.short / 32768.0f).coerceIn(-1f, 1f)
+                }
+                shortsRead
+            }
+        } catch (_: Exception) {
+            0
+        }
+    }
+
+    /**
      * Decodes any audio or video file (WAV, MP3, AAC, M4A, MP4, FLAC, OGG) from an Android content URI
-     * or local File into a normalized 44.1kHz FloatArray PCM buffer (plus interleaved stereo for stem splitting).
+     * or local File into a normalized 44.1kHz PCM buffer + Disk-Backed .pcm16 cache + 512-point Waveform Peaks.
      */
     suspend fun decodeUri(context: Context, uri: Uri): DecodedAudio = withContext(Dispatchers.IO) {
         var fileName = "Imported_Media_${System.currentTimeMillis()}"
@@ -42,7 +153,18 @@ object AudioDecoder {
             }
         } catch (_: Exception) {}
 
-        val cacheFile = File(context.cacheDir, "import_${System.currentTimeMillis()}_${fileName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}")
+        // Persist read URI permission if possible for project auto-save reload
+        try {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {}
+
+        val cacheFile = File(
+            context.cacheDir,
+            "import_${System.currentTimeMillis()}_${fileName.replace("[^a-zA-Z0-9._-]".toRegex(), "_")}"
+        )
         context.contentResolver.openInputStream(uri)?.use { input ->
             FileOutputStream(cacheFile).use { output ->
                 input.copyTo(output)
@@ -63,17 +185,17 @@ object AudioDecoder {
             )
         }
 
-        // Fast-path native RIFF WAV parser (handles 8/16/24/32-bit PCM & IEEE Float WAV without MediaCodec raw failure)
+        // 1. Fast-path native RIFF WAV parser (handles 8/16/24/32-bit PCM & IEEE Float WAV)
         val wavResult = tryParseRiffWav(file, displayFileName)
         if (wavResult != null && wavResult.samples.isNotEmpty()) {
             return@withContext wavResult
         }
 
-        // Hardware MediaExtractor + MediaCodec decoder for MP3, AAC, M4A, OGG, MP4 video audio tracks
+        // 2. Hardware MediaExtractor + MediaCodec decoder for MP3, AAC, M4A, OGG, MP4 video audio tracks
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(file.absolutePath)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             return@withContext DecodedAudio(
                 fileName = displayFileName,
                 samples = FloatArray(0),
@@ -120,7 +242,6 @@ object AudioDecoder {
         } else 0L
         val durationMs = max(500L, durationUs / 1000L)
 
-        // If raw PCM track inside container, read directly
         if (mime == MediaFormat.MIMETYPE_AUDIO_RAW) {
             extractor.release()
             return@withContext tryParseRiffWav(file, displayFileName) ?: DecodedAudio(
@@ -132,8 +253,11 @@ object AudioDecoder {
             )
         }
 
-        val pcmMono = mutableListOf<Float>()
-        val pcmStereo = mutableListOf<Float>()
+        val estimatedSamples = max(44100 * 10, ((durationMs * sourceSampleRate) / 1000L).toInt())
+        val pcmMono = PrimitiveFloatBuilder(min(estimatedSamples, 44100 * 180))
+        // Keep stereo buffer up to 6 minutes for 2-stem separation without heap overflow
+        val maxStereoFrames = 44100 * 360
+        val pcmStereo = PrimitiveFloatBuilder(min(estimatedSamples * 2, 44100 * 120))
         val bufferInfo = MediaCodec.BufferInfo()
         var codec: MediaCodec? = null
 
@@ -179,16 +303,20 @@ object AudioDecoder {
                                 val left = (shortBuffer.get(i) / 32768.0f).coerceIn(-1f, 1f)
                                 val right = (shortBuffer.get(i + 1) / 32768.0f).coerceIn(-1f, 1f)
                                 pcmMono.add((left + right) * 0.5f)
-                                pcmStereo.add(left)
-                                pcmStereo.add(right)
+                                if (pcmStereo.size < maxStereoFrames * 2) {
+                                    pcmStereo.add(left)
+                                    pcmStereo.add(right)
+                                }
                                 i += channelCount
                             }
                         } else {
                             for (i in 0 until numShorts) {
                                 val s = (shortBuffer.get(i) / 32768.0f).coerceIn(-1f, 1f)
                                 pcmMono.add(s)
-                                pcmStereo.add(s)
-                                pcmStereo.add(s)
+                                if (pcmStereo.size < maxStereoFrames * 2) {
+                                    pcmStereo.add(s)
+                                    pcmStereo.add(s)
+                                }
                             }
                         }
                     }
@@ -217,7 +345,6 @@ object AudioDecoder {
         val rawMono = pcmMono.toFloatArray()
         val rawStereo = pcmStereo.toFloatArray()
 
-        // Resample to 44100 Hz if source sample rate differs (e.g. 48000 Hz)
         val targetRate = 44100
         val finalMono = if (sourceSampleRate != targetRate && rawMono.isNotEmpty()) {
             resampleMono(rawMono, sourceSampleRate, targetRate)
@@ -231,10 +358,16 @@ object AudioDecoder {
             (finalMono.size.toLong() * 1000L) / targetRate
         } else durationMs
 
+        val pcmCacheFile = File(file.parentFile, "${file.name}.pcm16")
+        val pcmCachePath = writePcmCacheFile(pcmCacheFile, finalMono)
+        val peaks = computeWaveformPeaks(finalMono, 512)
+
         DecodedAudio(
             fileName = displayFileName,
             samples = finalMono,
             stereoSamples = finalStereo,
+            waveformPeaks = peaks,
+            pcmCachePath = pcmCachePath,
             sampleRate = targetRate,
             durationMs = actualDurationMs,
             cachedFilePath = file.absolutePath
@@ -309,7 +442,7 @@ object AudioDecoder {
                             bitsPerSample == 24 -> {
                                 val b0 = bb.get().toInt() and 0xFF
                                 val b1 = bb.get().toInt() and 0xFF
-                                val b2 = bb.get().toInt() // signed MSB
+                                val b2 = bb.get().toInt()
                                 val s24 = (b2 shl 16) or (b1 shl 8) or b0
                                 s24 / 8388608.0f
                             }
@@ -332,10 +465,16 @@ object AudioDecoder {
                 val finalStereo = if (sampleRate != targetRate) resampleStereo(stereo, sampleRate, targetRate) else stereo
                 val durationMs = (finalMono.size.toLong() * 1000L) / targetRate
 
+                val pcmCacheFile = File(file.parentFile, "${file.name}.pcm16")
+                val pcmCachePath = writePcmCacheFile(pcmCacheFile, finalMono)
+                val peaks = computeWaveformPeaks(finalMono, 512)
+
                 return DecodedAudio(
                     fileName = displayFileName,
                     samples = finalMono,
                     stereoSamples = finalStereo,
+                    waveformPeaks = peaks,
+                    pcmCachePath = pcmCachePath,
                     sampleRate = targetRate,
                     durationMs = durationMs,
                     cachedFilePath = file.absolutePath

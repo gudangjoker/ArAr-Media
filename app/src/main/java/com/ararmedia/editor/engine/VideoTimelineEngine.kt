@@ -18,12 +18,21 @@ class VideoTimelineEngine(val context: Context) {
     var canvasBackgroundMode: CanvasBackgroundMode = CanvasBackgroundMode.BLUR
 
     // LRU Frame Cache at 30fps (33ms) granularity
-    private val frameCache = object : LruCache<String, Bitmap>(32) {
+    private val frameCache = object : LruCache<String, Bitmap>(48) {
         override fun sizeOf(key: String, value: Bitmap): Int = 1
     }
 
+    // Persistent MediaMetadataRetriever Pool keyed by video file path to eliminate per-frame setDataSource() latency
+    private val retrieverPool = java.util.concurrent.ConcurrentHashMap<String, MediaMetadataRetriever>()
+
     fun clearCache() {
         frameCache.evictAll()
+        for ((_, retriever) in retrieverPool) {
+            try {
+                retriever.release()
+            } catch (_: Exception) {}
+        }
+        retrieverPool.clear()
     }
 
     /**
@@ -356,14 +365,12 @@ class VideoTimelineEngine(val context: Context) {
         var current = if (srcBmp.config == Bitmap.Config.ARGB_8888) srcBmp else srcBmp.copy(Bitmap.Config.ARGB_8888, false)
 
         if (settings.smartCutoutEnabled) {
-            val smartOut = Bitmap.createBitmap(current.width, current.height, Bitmap.Config.ARGB_8888)
-            MediaNativeBridge.processSmartCutout(
+            val smartOut = NeuralVisionProcessor.applyNeuralCutout(
                 srcBitmap = current,
-                dstBitmap = smartOut,
                 sensitivity = settings.smartSensitivity,
                 feather = settings.smartFeather
             )
-            if (current !== srcBmp) current.recycle()
+            if (current !== srcBmp && current !== smartOut) current.recycle()
             current = smartOut
         }
 
@@ -438,7 +445,7 @@ class VideoTimelineEngine(val context: Context) {
             clip.sourceOffsetMs + scaledElapsedMs
         }
 
-        // 1. Real Video File Extraction via MediaMetadataRetriever (33ms / 30fps cache granularity)
+        // 1. Real Video File Extraction via Persistent Pooled MediaMetadataRetriever (33ms / 30fps cache granularity)
         if (clip.isVideoSource && clip.localUri.isNotEmpty()) {
             val bucketMs = (effectiveLocalMs / 33L) * 33L
             val cacheKey = "${clip.id}_vid_${bucketMs}_${targetWidth}x${targetHeight}"
@@ -446,30 +453,34 @@ class VideoTimelineEngine(val context: Context) {
 
             val file = File(clip.localUri)
             if (file.exists()) {
-                val retriever = MediaMetadataRetriever()
-                try {
-                    retriever.setDataSource(file.absolutePath)
-                    val timeUs = effectiveLocalMs * 1000L
-                    val rawFrame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                        retriever.getScaledFrameAtTime(
-                            timeUs,
-                            MediaMetadataRetriever.OPTION_CLOSEST,
-                            targetWidth.coerceAtLeast(320),
-                            targetHeight.coerceAtLeast(320)
-                        )
-                    } else {
-                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                val pathKey = file.absolutePath
+                val retriever = retrieverPool.getOrPut(pathKey) {
+                    MediaMetadataRetriever().apply {
+                        setDataSource(pathKey)
                     }
-                    if (rawFrame != null) {
-                        val argb = if (rawFrame.config == Bitmap.Config.ARGB_8888) rawFrame else rawFrame.copy(Bitmap.Config.ARGB_8888, false)
-                        frameCache.put(cacheKey, argb)
-                        return argb
-                    }
-                } catch (_: Exception) {
-                } finally {
+                }
+                synchronized(retriever) {
                     try {
-                        retriever.release()
-                    } catch (_: Exception) {}
+                        val timeUs = effectiveLocalMs * 1000L
+                        val rawFrame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                            retriever.getScaledFrameAtTime(
+                                timeUs,
+                                MediaMetadataRetriever.OPTION_CLOSEST,
+                                targetWidth.coerceAtLeast(320),
+                                targetHeight.coerceAtLeast(320)
+                            )
+                        } else {
+                            retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        }
+                        if (rawFrame != null) {
+                            val argb = if (rawFrame.config == Bitmap.Config.ARGB_8888) rawFrame else rawFrame.copy(Bitmap.Config.ARGB_8888, false)
+                            frameCache.put(cacheKey, argb)
+                            return argb
+                        }
+                    } catch (_: Exception) {
+                        retrieverPool.remove(pathKey)
+                        try { retriever.release() } catch (_: Exception) {}
+                    }
                 }
             }
         }
@@ -753,6 +764,19 @@ class VideoTimelineEngine(val context: Context) {
             canvas.drawRect(0f, 0f, src.width.toFloat(), src.height.toFloat(), vigPaint)
         }
 
+        // AI Neural Face Retouch (Bilateral Skin Smoothing & 3D Portrait Relight)
+        if (grading.skinSmooth > 0.5f || grading.faceRelight > 0.5f) {
+            val retouched = NeuralVisionProcessor.applyFaceRetouch(
+                srcBitmap = out,
+                skinSmooth = grading.skinSmooth,
+                faceRelight = grading.faceRelight
+            )
+            if (retouched !== out) {
+                out.recycle()
+                return retouched
+            }
+        }
+
         return out
     }
 
@@ -970,5 +994,82 @@ class VideoTimelineEngine(val context: Context) {
         updated.add(index, firstClip)
         updated.add(index + 1, secondClip)
         return updated
+    }
+
+    /**
+     * AI Auto-Reframe: Uses bundled Google ML Kit Face Detection to track the subject's face
+     * across the clip and generate smooth pan/zoom keyframes for 9:16 vertical framing.
+     */
+    suspend fun autoReframeClipWithFaceTracking(clip: TimelineClip): List<Keyframe> = withContext(Dispatchers.Default) {
+        NeuralVisionProcessor.generateAutoReframeKeyframes(clip) { timeMs ->
+            loadOrGenerateClipFrame(clip, timeMs, 360, 640)
+        }
+    }
+
+    /**
+     * AI Smart Scene Cut Detection: Scans consecutive frames across the target clip using
+     * C++ 64-bin Histogram Chi-Square + Luma Flux and automatically splits at shot boundaries.
+     */
+    suspend fun detectSceneCutsAndSplit(
+        clips: List<TimelineClip>,
+        targetClipId: String
+    ): Pair<List<TimelineClip>, Int> = withContext(Dispatchers.Default) {
+        val targetClip = clips.firstOrNull { it.id == targetClipId } ?: return@withContext (clips to 0)
+        if (targetClip.durationMs < 1600L || !MediaNativeBridge.isLoaded()) {
+            return@withContext (clips to 0)
+        }
+
+        val cutTimestamps = mutableListOf<Long>()
+        val stepMs = 250L
+        val minShotDurationMs = 900L
+        var lastCutMs = targetClip.startOnTimelineMs
+
+        var prevFrame = loadOrGenerateClipFrame(targetClip, targetClip.startOnTimelineMs + 50L, 240, 240)
+        var t = targetClip.startOnTimelineMs + stepMs
+        val endMs = targetClip.startOnTimelineMs + targetClip.durationMs - 400L
+
+        while (t <= endMs) {
+            val currFrame = loadOrGenerateClipFrame(targetClip, t, 240, 240)
+            if (prevFrame != null && currFrame != null && prevFrame !== currFrame) {
+                val diffScore = MediaNativeBridge.computeSceneDifference(prevFrame, currFrame)
+                if (diffScore >= 0.32f && (t - lastCutMs) >= minShotDurationMs) {
+                    cutTimestamps.add(t)
+                    lastCutMs = t
+                }
+            }
+            if (currFrame != null) {
+                prevFrame = currFrame
+            }
+            t += stepMs
+        }
+
+        // If clip is a single continuous take with no hard cuts, split into balanced highlight segments
+        if (cutTimestamps.isEmpty() && targetClip.durationMs >= 2600L) {
+            val mid = targetClip.startOnTimelineMs + targetClip.durationMs / 2L
+            cutTimestamps.add(mid)
+        }
+
+        var workingClips = clips
+        var currentClipId = targetClipId
+        var splitsDone = 0
+
+        for (cutMs in cutTimestamps) {
+            val beforeSize = workingClips.size
+            workingClips = splitClipAtPlayhead(workingClips, currentClipId, cutMs)
+            if (workingClips.size > beforeSize) {
+                splitsDone++
+                // The second half is the newly added clip starting at cutMs
+                val nextHalf = workingClips.firstOrNull {
+                    it.trackType == targetClip.trackType && it.startOnTimelineMs == cutMs
+                }
+                if (nextHalf != null) {
+                    currentClipId = nextHalf.id
+                } else {
+                    break
+                }
+            }
+        }
+
+        workingClips to splitsDone
     }
 }

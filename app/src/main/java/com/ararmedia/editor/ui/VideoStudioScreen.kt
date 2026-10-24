@@ -59,6 +59,7 @@ fun VideoStudioScreen(
     val requestedToolPanel by viewModel.requestedToolPanel.collectAsState()
     val isAiProcessing by viewModel.isAiProcessing.collectAsState()
     val aiStatusMessage by viewModel.aiStatusMessage.collectAsState()
+    val captionLanguage by viewModel.captionLanguage.collectAsState()
 
     val isExporting by viewModel.isExporting.collectAsState()
     val exportProgress by viewModel.exportProgress.collectAsState()
@@ -396,6 +397,8 @@ fun VideoStudioScreen(
                         "text" -> {
                             TextCaptionEditorPanel(
                                 selectedClip = selectedClip,
+                                captionLanguage = captionLanguage,
+                                onLanguageChange = { viewModel.setCaptionLanguage(it) },
                                 onAddOrUpdateText = { text, sizeSp, color, isKaraoke, showPill, editId ->
                                     viewModel.addOrUpdateTextClip(text, sizeSp, color, isKaraoke, showPill, editId)
                                     activeBottomPanel = null
@@ -406,10 +409,12 @@ fun VideoStudioScreen(
                                 },
                                 onStartSpeechDictation = {
                                     try {
+                                        val langTag = if (captionLanguage == "id") "id-ID" else "en-US"
                                         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                                             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                            putExtra(RecognizerIntent.EXTRA_LANGUAGE, langTag)
                                             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak caption lines...")
+                                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak caption lines ($langTag)...")
                                         }
                                         speechRecognizerLauncher.launch(intent)
                                     } catch (_: Exception) {
@@ -425,6 +430,7 @@ fun VideoStudioScreen(
                                 beatCount = beatMarkers.size,
                                 onVolumeChange = { vol, muted -> viewModel.updateClipVolume(vol, muted) },
                                 onApplyAiDenoise = { viewModel.applyAiDenoise() },
+                                onApplyVoiceEnhance = { viewModel.applyAiVoiceEnhance() },
                                 onSelectVoicePreset = { viewModel.setVoicePreset(it) },
                                 onDetectBeats = { viewModel.detectBeatsOnTimeline() },
                                 onOpenDaw = { viewModel.navigateTo(2) }
@@ -434,8 +440,10 @@ fun VideoStudioScreen(
                             CanvasSettingsPanel(
                                 currentRatio = aspectRatio,
                                 currentBgMode = canvasBgMode,
+                                isAutoReframed = selectedClip?.isAutoReframed == true,
                                 onRatioSelected = { viewModel.setAspectRatio(it) },
-                                onBgModeSelected = { viewModel.setCanvasBackgroundMode(it) }
+                                onBgModeSelected = { viewModel.setCanvasBackgroundMode(it) },
+                                onApplyAutoReframe = { viewModel.applyAiAutoReframe() }
                             )
                         }
                         "export" -> {
@@ -491,6 +499,22 @@ fun VideoStudioScreen(
                 }
                 StudioToolButton(icon = Icons.Default.ContentCut, label = "Split", isEnabled = selectedClipId != null) {
                     viewModel.splitActiveClip()
+                }
+                StudioToolButton(
+                    icon = Icons.Default.AutoFixNormal,
+                    label = "Scene Cut",
+                    isEnabled = selectedClipId != null,
+                    iconTint = StudioCyanAccent
+                ) {
+                    viewModel.applyAiSceneCutDetection()
+                }
+                StudioToolButton(
+                    icon = Icons.Default.CenterFocusStrong,
+                    label = if (selectedClip?.isAutoReframed == true) "Reframed" else "Reframe",
+                    isEnabled = selectedClipId != null,
+                    iconTint = if (selectedClip?.isAutoReframed == true) StudioGreenAccent else StudioCyanAccent
+                ) {
+                    viewModel.applyAiAutoReframe()
                 }
                 StudioToolButton(
                     icon = Icons.Default.Speed,
@@ -553,6 +577,13 @@ fun VideoStudioScreen(
                     iconTint = if (selectedClip?.isAiDenoised == true) StudioGreenAccent else Color.White
                 ) {
                     viewModel.applyAiDenoise()
+                }
+                StudioToolButton(
+                    icon = Icons.Default.RecordVoiceOver,
+                    label = if (selectedClip?.isVoiceEnhanced == true) "Voice+" else "Voice AI",
+                    iconTint = if (selectedClip?.isVoiceEnhanced == true) StudioGoldAccent else Color.White
+                ) {
+                    viewModel.applyAiVoiceEnhance()
                 }
                 StudioToolButton(
                     icon = Icons.Default.FilterVintage,
@@ -837,11 +868,32 @@ private fun ClipAnimationPanel(
 private fun CanvasSettingsPanel(
     currentRatio: AspectRatio,
     currentBgMode: CanvasBackgroundMode,
+    isAutoReframed: Boolean,
     onRatioSelected: (AspectRatio) -> Unit,
-    onBgModeSelected: (CanvasBackgroundMode) -> Unit
+    onBgModeSelected: (CanvasBackgroundMode) -> Unit,
+    onApplyAutoReframe: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Aspect Ratio", fontSize = 11.sp, color = Color.LightGray)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Aspect Ratio", fontSize = 11.sp, color = Color.LightGray)
+            FilledTonalButton(
+                onClick = onApplyAutoReframe,
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                modifier = Modifier.height(28.dp)
+            ) {
+                Icon(Icons.Default.CenterFocusStrong, contentDescription = null, tint = StudioCyanAccent, modifier = Modifier.size(14.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    if (isAutoReframed) "AI Face Tracked (9:16)" else "AI Auto-Reframe (Track Face)",
+                    fontSize = 10.sp,
+                    color = StudioCyanAccent
+                )
+            }
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -885,6 +937,7 @@ private fun AudioAndAiFxPanel(
     beatCount: Int,
     onVolumeChange: (Float, Boolean) -> Unit,
     onApplyAiDenoise: () -> Unit,
+    onApplyVoiceEnhance: () -> Unit,
     onSelectVoicePreset: (Int) -> Unit,
     onDetectBeats: () -> Unit,
     onOpenDaw: () -> Unit
@@ -958,33 +1011,42 @@ private fun AudioAndAiFxPanel(
         }
 
         // AI Audio Actions Row
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             FilledTonalButton(
                 onClick = onApplyAiDenoise,
                 modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
             ) {
-                Icon(Icons.Default.NoiseAware, contentDescription = null, modifier = Modifier.size(14.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("AI Denoise", fontSize = 10.sp)
+                Icon(Icons.Default.NoiseAware, contentDescription = null, modifier = Modifier.size(13.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("RNNoise", fontSize = 10.sp)
+            }
+            FilledTonalButton(
+                onClick = onApplyVoiceEnhance,
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
+            ) {
+                Icon(Icons.Default.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(13.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("Voice AI", fontSize = 10.sp)
             }
             FilledTonalButton(
                 onClick = onDetectBeats,
                 modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
             ) {
-                Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(14.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Auto Beat (${detectedBpm.toInt()} BPM)", fontSize = 10.sp)
+                Icon(Icons.Default.Bolt, contentDescription = null, modifier = Modifier.size(13.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("Beat (${detectedBpm.toInt()})", fontSize = 10.sp)
             }
             FilledTonalButton(
                 onClick = onOpenDaw,
                 modifier = Modifier.weight(1f),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp)
             ) {
-                Icon(Icons.Default.GraphicEq, contentDescription = null, modifier = Modifier.size(14.dp))
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Pro DAW ($beatCount)", fontSize = 10.sp)
+                Icon(Icons.Default.GraphicEq, contentDescription = null, modifier = Modifier.size(13.dp))
+                Spacer(modifier = Modifier.width(3.dp))
+                Text("DAW ($beatCount)", fontSize = 10.sp)
             }
         }
     }
@@ -1052,6 +1114,8 @@ private fun KeyframeEditorPanel(
 @Composable
 private fun TextCaptionEditorPanel(
     selectedClip: TimelineClip?,
+    captionLanguage: String,
+    onLanguageChange: (String) -> Unit,
     onAddOrUpdateText: (String, Float, Color, Boolean, Boolean, String?) -> Unit,
     onGenerateAutoCaptions: () -> Unit,
     onStartSpeechDictation: () -> Unit
@@ -1074,6 +1138,33 @@ private fun TextCaptionEditorPanel(
     }
 
     Column(modifier = Modifier.fillMaxWidth().padding(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Caption Language (On-Device ASR):", fontSize = 10.sp, color = Color.LightGray)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(
+                    selected = captionLanguage == "id",
+                    onClick = { onLanguageChange("id") },
+                    label = { Text("Bahasa Indonesia (ID)", fontSize = 10.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = StudioCyanAccent,
+                        selectedLabelColor = Color.Black
+                    )
+                )
+                FilterChip(
+                    selected = captionLanguage == "en",
+                    onClick = { onLanguageChange("en") },
+                    label = { Text("English (EN)", fontSize = 10.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = StudioCyanAccent,
+                        selectedLabelColor = Color.Black
+                    )
+                )
+            }
+        }
         OutlinedTextField(
             value = textValue,
             onValueChange = { textValue = it },

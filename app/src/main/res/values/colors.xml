@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <color name="ic_launcher_background">#090813</color>
     <color name="studio_black">#0A0B10</color>
     <color name="studio_dark">#12131C</color>
     <color name="studio_surface">#1A1C29</color>

@@ -1,8 +1,10 @@
 package com.ararmedia.editor.engine
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.os.SystemClock
 import com.ararmedia.editor.model.BeatMarker
 import com.ararmedia.editor.model.SpeedCurvePreset
 import com.ararmedia.editor.model.StemSplitResult
@@ -37,6 +39,12 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
     private var playbackJob: Job? = null
     private val coroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
+    @Volatile
+    private var playbackStartTimelineMs: Long = 0L
+
+    @Volatile
+    private var playbackStartWallMs: Long = 0L
+
     private var activeBuffer: FloatArray = FloatArray(0)
     private var activeStereoBuffer: FloatArray = FloatArray(0)
 
@@ -65,6 +73,24 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
     fun getActiveBuffer(): FloatArray = activeBuffer.copyOf()
 
     /**
+     * Master Hardware Audio Clock: returns the exact millisecond currently exiting the speaker DAC.
+     * Eliminates A/V drift during Video Studio preview playback.
+     */
+    fun getCurrentHardwarePlaybackMs(): Long {
+        if (!_isPlaying.value) return _playbackPositionMs.value
+        val track = audioTrack
+        if (track != null && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+            val headFrames = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            if (headFrames > 0L) {
+                val hardwareElapsedMs = (headFrames * 1000L) / sampleRate
+                return playbackStartTimelineMs + hardwareElapsedMs
+            }
+        }
+        val wallElapsed = (SystemClock.elapsedRealtime() - playbackStartWallMs).coerceAtLeast(0L)
+        return playbackStartTimelineMs + wallElapsed
+    }
+
+    /**
      * Renders an audio buffer offline through the C++ DSP Rack (10-Band EQ, Pitch Shift, Voice Preset, Compressor, Reverb).
      */
     fun renderProcessedBuffer(inputPcm: FloatArray = activeBuffer): FloatArray {
@@ -88,8 +114,188 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
     }
 
     /**
-     * Mixes all active timeline audio clips (MAIN_VIDEO, PIP_OVERLAY, MUSIC_BGM, VOICEOVER)
-     * into a unified master timeline PCM buffer.
+     * Mixes a single real-time chunk [chunkSamples] at [timelineStartSample] directly from active clips
+     * (supporting both in-memory samples and disk-backed .pcm16 caches) for zero-delay streaming playback.
+     */
+    fun mixTimelineChunk(
+        clips: List<TimelineClip>,
+        timelineStartSample: Int,
+        chunkSamples: Int,
+        outChunk: FloatArray
+    ) {
+        java.util.Arrays.fill(outChunk, 0, chunkSamples, 0f)
+        val timelineEndSample = timelineStartSample + chunkSamples
+        var mixedAny = false
+
+        for (clip in clips) {
+            if (clip.isMuted || clip.volume <= 0.001f) continue
+            val clipStartSample = ((clip.startOnTimelineMs * sampleRate) / 1000L).toInt()
+            val clipDurSamples = ((clip.durationMs * sampleRate) / 1000L).toInt()
+            val clipEndSample = clipStartSample + clipDurSamples
+
+            if (clipEndSample <= timelineStartSample || clipStartSample >= timelineEndSample) continue
+
+            val overlapStart = max(timelineStartSample, clipStartSample)
+            val overlapEnd = min(timelineEndSample, clipEndSample)
+            if (overlapEnd <= overlapStart) continue
+
+            val srcOffsetSamples = ((clip.sourceOffsetMs * sampleRate) / 1000L).toInt()
+            val speed = clip.speed.coerceIn(0.2f, 4.0f)
+            val vol = clip.volume.coerceIn(0f, 2f)
+
+            val memSamples = clip.audioSamples
+            if (memSamples != null && memSamples.isNotEmpty()) {
+                mixedAny = true
+                for (tSample in overlapStart until overlapEnd) {
+                    val relSample = tSample - clipStartSample
+                    val scaledOffset = mapAudioRelSample(relSample, clipDurSamples, speed, clip.speedCurve)
+                    val srcIdx = if (clip.isReversed) {
+                        memSamples.size - 1 - (srcOffsetSamples + scaledOffset)
+                    } else {
+                        srcOffsetSamples + scaledOffset
+                    }
+                    if (srcIdx in memSamples.indices) {
+                        val dstIdx = tSample - timelineStartSample
+                        outChunk[dstIdx] = (outChunk[dstIdx] + memSamples[srcIdx] * vol).coerceIn(-1f, 1f)
+                    }
+                }
+            } else if (clip.pcmCachePath.isNotEmpty()) {
+                val relFirst = overlapStart - clipStartSample
+                val diskStart = srcOffsetSamples + (relFirst * speed).toInt()
+                val diskCount = max(chunkSamples, ((overlapEnd - overlapStart) * speed).toInt() + 16)
+                val tempDiskBuf = FloatArray(diskCount)
+                val readCount = AudioDecoder.readPcmWindowFromDisk(clip.pcmCachePath, diskStart, diskCount, tempDiskBuf)
+                if (readCount > 0) {
+                    mixedAny = true
+                    for (tSample in overlapStart until overlapEnd) {
+                        val localIdx = ((tSample - overlapStart) * speed).toInt().coerceIn(0, readCount - 1)
+                        val dstIdx = tSample - timelineStartSample
+                        outChunk[dstIdx] = (outChunk[dstIdx] + tempDiskBuf[localIdx] * vol).coerceIn(-1f, 1f)
+                    }
+                }
+            }
+        }
+
+        if (!mixedAny && activeBuffer.isNotEmpty() && timelineStartSample < activeBuffer.size) {
+            val copyCount = min(chunkSamples, activeBuffer.size - timelineStartSample)
+            for (i in 0 until copyCount) {
+                outChunk[i] = activeBuffer[timelineStartSample + i]
+            }
+        }
+    }
+
+    private fun mapAudioRelSample(
+        relSample: Int,
+        clipDurationSamples: Int,
+        speed: Float,
+        curve: SpeedCurvePreset
+    ): Int {
+        if (curve == SpeedCurvePreset.NORMAL || clipDurationSamples <= 100) {
+            return (relSample * speed).toInt()
+        }
+        val u = (relSample.toDouble() / clipDurationSamples.toDouble()).coerceIn(0.0, 1.0)
+        val warpedU = when (curve) {
+            SpeedCurvePreset.NORMAL -> u
+            SpeedCurvePreset.MONTAGE -> 0.5 + 0.5 * sin((u - 0.5) * PI)
+            SpeedCurvePreset.HERO -> u - 0.18 * sin(u * 2.0 * PI)
+            SpeedCurvePreset.BULLET -> 0.5 + 0.5 * (2.0 * u - 1.0).pow(3.0)
+            SpeedCurvePreset.JUMP_CUT -> (u + 0.08 * sin(u * 6.0 * PI)).coerceIn(0.0, 1.0)
+            SpeedCurvePreset.FLASH_IN -> 1.0 - (1.0 - u).pow(2.4)
+        }
+        return (warpedU * clipDurationSamples * speed).toInt()
+    }
+
+    /**
+     * Real-time chunked timeline audio streaming: starts AudioTrack immediately with zero pre-mix wait
+     * and locks hardware playback head position for A/V sync.
+     */
+    fun startTimelineStreamingPlayback(
+        clipsProvider: () -> List<TimelineClip>,
+        startMs: Long,
+        totalDurationProvider: () -> Long
+    ) {
+        stopPlayback()
+
+        val minBufSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        val chunkSize = 1024 // ~23.2ms low-latency audio quantum
+        audioTrack = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setBufferSizeInBytes(max(minBufSize, chunkSize * 4))
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .build()
+
+        playbackStartTimelineMs = startMs
+        playbackStartWallMs = SystemClock.elapsedRealtime()
+        _playbackPositionMs.value = startMs
+
+        audioTrack?.setVolume(1.0f)
+        audioTrack?.play()
+        _isPlaying.value = true
+
+        playbackJob = coroutineScope.launch {
+            val rawChunk = FloatArray(chunkSize)
+            val dspChunk = FloatArray(chunkSize)
+            val shortChunk = ShortArray(chunkSize)
+
+            var currentSample = ((startMs * sampleRate) / 1000L).toInt().coerceAtLeast(0)
+
+            while (isActive && _isPlaying.value) {
+                val totalDurMs = max(1000L, totalDurationProvider())
+                val totalSamples = ((totalDurMs * sampleRate) / 1000L).toInt()
+
+                if (currentSample >= totalSamples) {
+                    // Loop smoothly back to 0ms
+                    currentSample = 0
+                    playbackStartTimelineMs = 0L
+                    playbackStartWallMs = SystemClock.elapsedRealtime()
+                    try {
+                        audioTrack?.pause()
+                        audioTrack?.flush()
+                        audioTrack?.play()
+                    } catch (_: Exception) {}
+                }
+
+                val count = min(chunkSize, max(1, totalSamples - currentSample))
+                mixTimelineChunk(clipsProvider(), currentSample, count, rawChunk)
+
+                var grDb = 0f
+                if (nativeHandle != 0L) {
+                    grDb = MediaNativeBridge.processAudioPcm(nativeHandle, rawChunk, dspChunk, count)
+                } else {
+                    System.arraycopy(rawChunk, 0, dspChunk, 0, count)
+                }
+                _gainReductionDb.value = grDb
+
+                for (s in 0 until count) {
+                    shortChunk[s] = (dspChunk[s].coerceIn(-1.0f, 1.0f) * 32767.0f).toInt().toShort()
+                }
+
+                audioTrack?.write(shortChunk, 0, count)
+                currentSample += count
+                _playbackPositionMs.value = getCurrentHardwarePlaybackMs()
+            }
+        }
+    }
+
+    /**
+     * Mixes all active timeline audio clips into a unified master timeline PCM buffer for MP4 Export.
      */
     fun mixTimelineClipsToMasterPcm(
         clips: List<TimelineClip>,
@@ -98,54 +304,15 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
     ): FloatArray {
         val totalSamples = max(sampleRate, ((totalDurationMs * sampleRate) / 1000L).toInt())
         val mixBuffer = FloatArray(totalSamples)
-        var hasAnyClipSamples = false
+        val chunkSize = 4096
+        val chunkBuf = FloatArray(chunkSize)
 
-        for (clip in clips) {
-            if (clip.isMuted || clip.volume <= 0.001f) continue
-            val srcSamples = clip.audioSamples ?: continue
-            if (srcSamples.isEmpty()) continue
-            hasAnyClipSamples = true
-
-            val startSampleOnTimeline = ((clip.startOnTimelineMs * sampleRate) / 1000L).toInt().coerceIn(0, totalSamples)
-            val clipDurationSamples = ((clip.durationMs * sampleRate) / 1000L).toInt()
-            val endSampleOnTimeline = (startSampleOnTimeline + clipDurationSamples).coerceIn(startSampleOnTimeline, totalSamples)
-            val srcOffsetSamples = ((clip.sourceOffsetMs * sampleRate) / 1000L).toInt().coerceIn(0, srcSamples.size - 1)
-
-            val speed = clip.speed.coerceIn(0.2f, 4.0f)
-            val vol = clip.volume.coerceIn(0f, 2f)
-
-            for (dstIdx in startSampleOnTimeline until endSampleOnTimeline) {
-                val relSample = dstIdx - startSampleOnTimeline
-                val scaledOffset = if (clip.speedCurve == SpeedCurvePreset.NORMAL || clipDurationSamples <= 100) {
-                    (relSample * speed).toInt()
-                } else {
-                    val u = (relSample.toDouble() / clipDurationSamples.toDouble()).coerceIn(0.0, 1.0)
-                    val warpedU = when (clip.speedCurve) {
-                        SpeedCurvePreset.NORMAL -> u
-                        SpeedCurvePreset.MONTAGE -> 0.5 + 0.5 * sin((u - 0.5) * PI)
-                        SpeedCurvePreset.HERO -> u - 0.18 * sin(u * 2.0 * PI)
-                        SpeedCurvePreset.BULLET -> 0.5 + 0.5 * (2.0 * u - 1.0).pow(3.0)
-                        SpeedCurvePreset.JUMP_CUT -> (u + 0.08 * sin(u * 6.0 * PI)).coerceIn(0.0, 1.0)
-                        SpeedCurvePreset.FLASH_IN -> 1.0 - (1.0 - u).pow(2.4)
-                    }
-                    (warpedU * clipDurationSamples * speed).toInt()
-                }
-
-                val srcIdx = if (clip.isReversed) {
-                    (srcSamples.size - 1 - (srcOffsetSamples + scaledOffset))
-                } else {
-                    (srcOffsetSamples + scaledOffset)
-                }
-
-                if (srcIdx in srcSamples.indices) {
-                    mixBuffer[dstIdx] = (mixBuffer[dstIdx] + srcSamples[srcIdx] * vol).coerceIn(-1.0f, 1.0f)
-                }
-            }
-        }
-
-        if (!hasAnyClipSamples && activeBuffer.isNotEmpty()) {
-            val copyLen = min(totalSamples, activeBuffer.size)
-            System.arraycopy(activeBuffer, 0, mixBuffer, 0, copyLen)
+        var offset = 0
+        while (offset < totalSamples) {
+            val count = min(chunkSize, totalSamples - offset)
+            mixTimelineChunk(clips, offset, count, chunkBuf)
+            System.arraycopy(chunkBuf, 0, mixBuffer, offset, count)
+            offset += count
         }
 
         return if (applyMasterDsp) renderProcessedBuffer(mixBuffer) else mixBuffer
@@ -235,16 +402,18 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(max(minBufSize * 2, 4096 * 4))
+            .setBufferSizeInBytes(max(minBufSize, 2048 * 4))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
+        playbackStartTimelineMs = startMs
+        playbackStartWallMs = SystemClock.elapsedRealtime()
         audioTrack?.setVolume(1.0f)
         audioTrack?.play()
         _isPlaying.value = true
 
         playbackJob = coroutineScope.launch {
-            val chunkSize = 2048
+            val chunkSize = 1024
             val inChunk = FloatArray(chunkSize)
             val outChunk = FloatArray(chunkSize)
             val shortChunk = ShortArray(chunkSize)
@@ -271,8 +440,7 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
                 audioTrack?.write(shortChunk, 0, samplesToProcess)
 
                 currentSample += samplesToProcess
-                val currentMs = (currentSample.toLong() * 1000L) / sampleRate
-                _playbackPositionMs.value = currentMs
+                _playbackPositionMs.value = getCurrentHardwarePlaybackMs()
             }
 
             _isPlaying.value = false
@@ -301,9 +469,12 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
         if (wasPlaying) {
             stopPlayback()
         }
-        _playbackPositionMs.value = positionMs.coerceIn(0L, getDurationMs())
-        if (wasPlaying) {
-            startPlayback(_playbackPositionMs.value)
+        val clamped = positionMs.coerceAtLeast(0L)
+        playbackStartTimelineMs = clamped
+        playbackStartWallMs = SystemClock.elapsedRealtime()
+        _playbackPositionMs.value = clamped
+        if (wasPlaying && activeBuffer.isNotEmpty()) {
+            startPlayback(clamped)
         }
     }
 
@@ -395,16 +566,30 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
 
     // --- Offline Audio AI Suite ---
 
-    suspend fun denoiseBuffer(inputBuffer: FloatArray, reductionDb: Float = 18f): FloatArray = withContext(Dispatchers.Default) {
+    suspend fun denoiseBuffer(inputBuffer: FloatArray, reductionDb: Float = 20f): FloatArray = withContext(Dispatchers.Default) {
         if (inputBuffer.isEmpty() || !MediaNativeBridge.isLoaded()) return@withContext inputBuffer
         val outBuf = FloatArray(inputBuffer.size)
         MediaNativeBridge.spectralDenoise(inputBuffer, outBuf, sampleRate, reductionDb)
         outBuf
     }
 
-    suspend fun applyAiStudioDenoise(reductionDb: Float = 18f): FloatArray = withContext(Dispatchers.Default) {
+    suspend fun applyAiStudioDenoise(reductionDb: Float = 20f): FloatArray = withContext(Dispatchers.Default) {
         if (activeBuffer.isEmpty() || !MediaNativeBridge.isLoaded()) return@withContext activeBuffer
         val outBuf = denoiseBuffer(activeBuffer, reductionDb)
+        activeBuffer = outBuf
+        activeBuffer
+    }
+
+    suspend fun enhanceVoiceBuffer(inputBuffer: FloatArray, dereverbStrength: Float = 0.80f): FloatArray = withContext(Dispatchers.Default) {
+        if (inputBuffer.isEmpty() || !MediaNativeBridge.isLoaded()) return@withContext inputBuffer
+        val outBuf = FloatArray(inputBuffer.size)
+        MediaNativeBridge.enhanceVoicePcm(inputBuffer, outBuf, sampleRate, dereverbStrength)
+        outBuf
+    }
+
+    suspend fun applyAiVoiceEnhancer(dereverbStrength: Float = 0.80f): FloatArray = withContext(Dispatchers.Default) {
+        if (activeBuffer.isEmpty() || !MediaNativeBridge.isLoaded()) return@withContext activeBuffer
+        val outBuf = enhanceVoiceBuffer(activeBuffer, dereverbStrength)
         activeBuffer = outBuf
         activeBuffer
     }
@@ -452,12 +637,14 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
     }
 
     /**
-     * Detects speech cadence boundaries from the provided audio buffer and pairs them with
-     * recognized speech lines or acoustic phrase descriptors.
+     * Generates AI Auto-Captions using C++ VAD segmentation + On-Device Neural Speech-to-Text
+     * (piping 16kHz PCM directly to Android SpeechRecognizer on API 33+, with acoustic prosody fallback).
      */
     suspend fun generateAutoCaptions(
         sourceBuffer: FloatArray = activeBuffer,
-        recognizedLines: List<String> = emptyList()
+        recognizedLines: List<String> = emptyList(),
+        languageCode: String = "id",
+        context: Context? = null
     ): List<SubtitleEntry> = withContext(Dispatchers.Default) {
         if (sourceBuffer.isEmpty() || !MediaNativeBridge.isLoaded()) {
             return@withContext emptyList()
@@ -472,7 +659,15 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
                 val label = if (idx < recognizedLines.size && recognizedLines[idx].isNotBlank()) {
                     recognizedLines[idx]
                 } else {
-                    analyzeSegmentPhraseLabel(sourceBuffer, start, end, idx)
+                    OfflineSpeechTranscriber.transcribeSegmentPcm(
+                        context = context,
+                        pcm44k = sourceBuffer,
+                        sampleRate = sampleRate,
+                        startMs = start,
+                        endMs = end,
+                        languageCode = languageCode,
+                        segmentIndex = idx
+                    )
                 }
                 list.add(
                     SubtitleEntry(
@@ -485,39 +680,5 @@ class AudioDspProcessor(val sampleRate: Int = 44100) {
             }
         }
         list
-    }
-
-    private fun analyzeSegmentPhraseLabel(buffer: FloatArray, startMs: Long, endMs: Long, index: Int): String {
-        val startIdx = ((startMs * sampleRate) / 1000L).toInt().coerceIn(0, buffer.size)
-        val endIdx = ((endMs * sampleRate) / 1000L).toInt().coerceIn(startIdx, buffer.size)
-        val count = endIdx - startIdx
-        if (count <= 0) return "Subtitle ${index + 1}"
-
-        // Count syllable energy peaks (~160ms windows) and zero-crossing rate
-        val windowSize = max(1, sampleRate / 8)
-        var syllables = 0
-        var prevEnergy = 0.0
-        for (w in startIdx until endIdx step windowSize) {
-            val wEnd = min(endIdx, w + windowSize)
-            var e = 0.0
-            for (s in w until wEnd) {
-                e += buffer[s] * buffer[s]
-            }
-            e = sqrt(e / max(1, wEnd - w))
-            if (e > 0.06 && e > prevEnergy * 1.15) {
-                syllables++
-            }
-            prevEnergy = e
-        }
-
-        val defaultPhrases = listOf(
-            "Every frame tells a story",
-            "Feel the rhythm in motion",
-            "Create without limits",
-            "Capture the moment clearly",
-            "Bring your vision to life",
-            "Sound and motion in sync"
-        )
-        return defaultPhrases[(index + max(0, syllables - 1)) % defaultPhrases.size]
     }
 }

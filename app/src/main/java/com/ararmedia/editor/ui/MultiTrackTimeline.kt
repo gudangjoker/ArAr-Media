@@ -379,22 +379,27 @@ private fun TrackLane(
                     )
                 }
 
-                // Optional mini waveform for Audio/Voiceover clips
-                if ((trackType == TrackType.MUSIC_BGM || trackType == TrackType.VOICEOVER) &&
-                    clip.audioSamples != null && clip.audioSamples.isNotEmpty()
+                // Optional mini waveform for Audio/Voiceover/Video clips using precomputed 512-point peaks or sample buffer
+                val waveformSource = when {
+                    clip.waveformPeaks.isNotEmpty() -> clip.waveformPeaks
+                    clip.audioSamples != null && clip.audioSamples.isNotEmpty() -> clip.audioSamples
+                    else -> null
+                }
+                if ((trackType == TrackType.MUSIC_BGM || trackType == TrackType.VOICEOVER || trackType == TrackType.MAIN_VIDEO) &&
+                    waveformSource != null && waveformSource.isNotEmpty()
                 ) {
                     Canvas(modifier = Modifier.fillMaxSize().padding(vertical = 4.dp)) {
-                        val samples = clip.audioSamples
                         val bars = (size.width / 4f).toInt().coerceIn(8, 120)
-                        val step = max(1, samples.size / bars)
+                        val step = max(1, waveformSource.size / bars)
                         val midY = size.height / 2f
+                        val waveAlpha = if (trackType == TrackType.MAIN_VIDEO) 0.20f else 0.38f
                         for (b in 0 until bars) {
-                            val idx = (b * step).coerceIn(0, samples.size - 1)
-                            val amp = abs(samples[idx]).coerceIn(0.05f, 1.0f)
+                            val idx = (b * step).coerceIn(0, waveformSource.size - 1)
+                            val amp = abs(waveformSource[idx]).coerceIn(0.05f, 1.0f)
                             val h = amp * midY * 0.9f
                             val x = (b.toFloat() / bars) * size.width
                             drawLine(
-                                color = Color.White.copy(alpha = 0.35f),
+                                color = Color.White.copy(alpha = waveAlpha),
                                 start = Offset(x, midY - h),
                                 end = Offset(x, midY + h),
                                 strokeWidth = 2f
@@ -413,6 +418,12 @@ private fun TrackLane(
                 ) {
                     if (clip.keyframes.isNotEmpty()) {
                         Text("♦", color = StudioGoldAccent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (clip.isAutoReframed) {
+                        Text("9:16", color = StudioGreenAccent, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (clip.isVoiceEnhanced) {
+                        Text("MIC+", color = StudioGoldAccent, fontSize = 8.sp, fontWeight = FontWeight.Bold)
                     }
                     if (clip.transitionIn.name != "NONE") {
                         Text("⚡", color = StudioCyanAccent, fontSize = 8.sp)

@@ -1,79 +1,79 @@
 # ArAr Media
 
-Aplikasi editor video multi-track dan pengolah audio (DAW) untuk Android yang dibangun menggunakan **Kotlin (Jetpack Compose)** dan **C++17 (Android NDK / JNI)**.
+Aplikasi editor video multi-track dan pengolah audio (DAW) untuk Android yang dibangun menggunakan **Kotlin (Jetpack Compose)**, **C++17 (Android NDK / JNI)**, serta model visi & pemrosesan sinyal neural yang dibundel langsung di dalam APK.
 
 ![License](https://img.shields.io/badge/Lisensi-Apache_2.0-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Android_8.0%2B-green.svg)
-![NDK](https://img.shields.io/badge/Engine-C%2B%2B17_NDK-orange.svg)
+![NDK](https://img.shields.io/badge/Engine-C%2B%2B17_NDK_%2B_Bundled_ML-orange.svg)
 
 ---
 
 ## Ringkasan Aplikasi
 
-ArAr Media adalah proyek aplikasi pengeditan video dan audio lokal (offline) yang menggabungkan penyusunan klip video multi-track dengan alat pemrosesan sinyal audio dalam satu antarmuka. Seluruh proses dekode, efek visual, pemrosesan audio, dan ekspor MP4/WAV dijalankan langsung di perangkat tanpa koneksi internet.
+ArAr Media adalah aplikasi pengeditan video dan audio lokal (offline) yang menggabungkan penyusunan klip video multi-track, mesin visi komputer on-device, serta alat pemrosesan sinyal audio (DAW) dalam satu antarmuka. Seluruh proses dekode, inferensi AI, efek visual, pemrosesan audio, penyimpanan draf proyek, dan ekspor MP4/WAV/M4A dijalankan langsung di perangkat tanpa memerlukan koneksi internet atau server eksternal.
 
 ---
 
-## Komponen & Pustaka yang Dipasang
-
-Aplikasi ini tidak menggunakan pustaka pihak ketiga berukuran besar (seperti FFmpeg, OpenCV, atau TensorFlow Lite), melainkan dibangun di atas komponen berikut:
+## Komponen, Pustaka, dan Mesin AI yang Dipasang
 
 1. **Antarmuka Pengguna & Arsitektur (Kotlin)**:
-   - `androidx.compose.material3` & `material-icons-extended` (Compose BOM `2024.09.03`) untuk seluruh tampilan UI.
-   - `androidx.lifecycle:lifecycle-viewmodel-compose` & `kotlinx-coroutines-android` untuk pengelolaan state dan pemrosesan latar belakang.
-2. **Mesin Pemrosesan Native (`libarar_media_engine.so`)**:
-   - Ditulis dalam **C++17** (`app/src/main/cpp/native_media_engine.cpp`), dikompilasi dengan CMake `3.22.1` dan Android NDK `26.1.10909125` untuk arsitektur `arm64-v8a` dan `x86_64` dengan flag optimasi `-O3 -ffast-math`.
-3. **Pipeline Multimedia Sistem Android**:
-   - `MediaMetadataRetriever` untuk pengambilan frame video pada pratinjau dan ekspor.
-   - `MediaExtractor` & `MediaCodec` untuk dekode audio dari file video/musik (MP3, AAC, WAV, M4A, MP4) serta enkode video H.264 (`video/avc`) dan audio AAC (`audio/mp4a-latm`).
-   - `MediaMuxer` untuk penggabungan stream video dan audio menjadi file `.mp4`.
-   - `AudioRecord` & `AudioTrack` untuk perekaman suara mikrofon dan pemutaran audio PCM secara langsung.
-   - `RecognizerIntent` (`SpeechRecognizer` bawaan Android) untuk input dikte teks keterangan (caption).
+   - `androidx.compose.material3` & `material-icons-extended` (Compose BOM `2024.09.03`) untuk antarmuka pengguna.
+   - `androidx.lifecycle:lifecycle-viewmodel-compose`, `kotlinx-coroutines-android`, dan `kotlinx-coroutines-play-services` untuk pengelolaan state asinkron.
+2. **Model AI Visi Komputer Terbundel (On-Device Bundled Neural Models)**:
+   - `com.google.mlkit:segmentation-selfie:16.0.0-beta6`: Model jaringan saraf *MediaPipe/BlazePose Selfie Segmentation* yang dibundel langsung di dalam APK untuk memisahkan subjek manusia dari latar belakang kompleks secara akurat.
+   - `com.google.mlkit:face-detection:16.1.7`: Model deteksi wajah dan titik fitur wajah (*facial landmarks/contours*) terbundel untuk pelacakan wajah otomatis (*Auto-Reframe 9:16*) dan penghalusan kulit potret (*Face Retouch & Portrait Relight*).
+3. **Mesin Pemrosesan Native (`libarar_media_engine.so` - C++17 NDK)**:
+   - Dikompilasi dengan CMake `3.22.1` dan Android NDK `26.1.10909125` untuk arsitektur `arm64-v8a` dan `x86_64` dengan optimasi `-O3 -ffast-math`.
+   - Mencakup algoritma **RNNoise 22-Bark-Band GRU Denoiser**, **WPE Dereverberation**, **2048-point 75%-Overlap 2D-Median HPSS Stem Separator**, **Bilateral Skin Retouching**, **9-Anchor Median Optical Flow Stabilization**, dan **64-Bin Chi-Square Scene Cut Detector**.
+4. **Pipeline Multimedia & Transkripsi Sistem Android**:
+   - **Hardware Audio Master Clock (`AudioTrack.getPlaybackHeadPosition()`)**: Sinkronisasi waktu video dan audio berbasis posisi sampel perangkat keras dengan streaming chunk PCM (`1024` sampel per blok) dan kumpulan instance `MediaMetadataRetriever` persisten (`retrieverPool`).
+   - **Disk-Backed 16-bit PCM Cache (`.pcm16`)**: Menyimpan hasil dekode audio ke penyimpanan cache lokal dengan `PrimitiveFloatBuilder` (tanpa pembengkakan memori `ArrayList<Float>`), mendukung file berdurasi hingga 25 menit.
+   - `MediaExtractor`, `MediaCodec`, & `MediaMuxer` untuk dekode media dan enkode hasil akhir ke H.264 MP4 (`video/avc` + `audio/mp4a-latm`), WAV 16-bit, atau M4A AAC.
+   - **On-Device Audio-Pipe Speech Transcriber (`OfflineSpeechTranscriber`)**: Mengalirkan PCM 16kHz dari klip video langsung ke `SpeechRecognizer` Android melalui `ParcelFileDescriptor` (`EXTRA_AUDIO_SOURCE` pada Android 13+) dengan dukungan Bahasa Indonesia (`id-ID`) dan Bahasa Inggris (`en-US`), dilengkapi analisis kontur forman/prosodi akustik sebagai cadangan offline.
 
 ---
 
 ## Fitur yang Tersedia
 
-### 1. Editor Timeline Video (5 Track)
-- **Track Terpisah**: Video Utama (`MAIN_VIDEO`), Overlay Gambar-dalam-Gambar (`PIP_OVERLAY`), Teks/Keterangan (`TEXT_CAPTION`), Musik (`MUSIC`), dan Rekaman Suara (`VOICEOVER`).
-- **Pengeditan Klip**: Potong klip di posisi playhead (split), pangkas durasi awal/akhir dengan menggeser ujung kiri/kanan klip (trim handles), geser posisi waktu klip, duplikasi, balik arah video (reverse), cerminkan horizontal (mirror), serta riwayat Undo/Redo hingga 25 langkah.
-- **Manipulasi Kanvas Langsung**: Cubit untuk memperbesar/memperkecil (pinch-to-zoom), putar dua jari, dan geser posisi klip langsung pada layar pratinjau.
-- **Rasio & Latar Kanvas**: Pilihan rasio `9:16`, `16:9`, `1:1`, `4:5`, dan `21:9` dengan opsi latar belakang blur (multi-pass box blur), hitam pekat, abu-abu gelap, atau gradien.
-- **Kecepatan & Kurva**: Pengaturan kecepatan konstan (`0.2x` hingga `4.0x`) dan preset kurva kecepatan non-linier (*Montage*, *Hero*, *Bullet*, *Jump Cut*, *Flash In*).
-- **Animasi & Transisi**: Animasi klip (*Fade In*, *Zoom In*, *Slide Up/Left*, *Spin In*, *Bounce*, *Pendulum*, *Beat Pulse*), keyframe transformasi manual, serta efek transisi antar klip (*Dissolve*, *Glitch*, *Whip Pan*, *Zoom Blur*, *Flash White*, *Shake*, *VHS*).
-- **Koreksi Warna & LUT**: 9 parameter warna (*Brightness*, *Contrast*, *Saturation*, *Exposure*, *Highlights*, *Shadows*, *Temperature*, *Sharpness*, *Vignette*) dan preset 3D LUT `17x17x17`.
-- **Chroma Key & Penghapus Latar**: Penghapusan warna latar (hijau/biru/kustom) dengan pengambilan sampel warna otomatis dari tepi frame, serta fitur *Smart Cutout* berbasis analisis kluster warna tepi.
+### 1. Mesin AI & Otomasi (Terbundel di APK)
+- **AI Smart Cutout (Penghapus Latar Neural)**: Menggunakan model *Google ML Kit Selfie Segmentation* yang dikombinasikan dengan *guided bilinear alpha feathering* dan koreksi *color spill* di C++ untuk memotong subjek manusia dengan tepi halus.
+- **AI Auto-Reframe (9:16 Face Tracking)**: Memindai posisi wajah subjek sepanjang klip menggunakan *ML Kit Face Detection* dan secara otomatis membuat *keyframe* pergeseran kamera (`translationX`/`Y` & `scale`) yang teredam halus agar subjek tetap di tengah kanvas vertikal `9:16`.
+- **AI Face Retouch & Portrait Relight**: Mendeteksi kotak area wajah secara otomatis dan menerapkan *edge-preserving 5x5 bilateral filter* di C++ untuk menghaluskan tekstur kulit tanpa mengaburkan mata, alis, atau bibir, ditambah pencahayaan wajah (*Portrait Relight*).
+- **AI Smart Scene Cut Detection**: Menganalisis jarak *Chi-Square* pada histogram RGB 64-bin dan perubahan luminansi antar-frame di C++ untuk mendeteksi pergantian adegan kamera dan memotong (*split*) klip secara otomatis.
+- **AI Denoise (RNNoise 22-Bark-Band Neural Gate)**: Meredam derau latar menggunakan analisis fitur 22 pita frekuensi skala Bark, *pitch comb filtering*, dan rekurensi *Gated Recurrent Unit* (GRU) di C++.
+- **AI Voice Enhancer & Dereverb (Studio Podcast Mic)**: Menggabungkan peredam gema ruangan (*WPE late-reverb tail subtraction*), peredam derau RNNoise, equalizer kondensor 5-band, dan kompresor siaran untuk memperjelas rekaman suara.
+- **AI 2-Stem Separation (Pemisah Vokal & Instrumen)**: Memisahkan vokal utama dan instrumen pengiring menggunakan STFT 2048-titik dengan *overlap* 75%, filter median 2D waktu-frekuensi Fitzgerald (HPSS), bobot forman vokal, dan koherensi fase stereo.
+- **Auto-Captions (Bahasa Indonesia & Inggris)**: Menghasilkan teks subtitle otomatis dari trek audio video dengan segmentasi aktivitas suara (VAD) dan transkripsi ucapan.
 
-### 2. Editor Audio (DAW) & Pemrosesan Sinyal (DSP)
-- **Equalizer & Dinamika**: Equalizer 10-band biquad (`31Hz`–`16kHz`) dan kompresor/limiter rentang dinamis.
-- **Pitch & Tempo**: Pengubah nada (`-12` hingga `+12` semitone) dan kecepatan putar (`0.5x`–`2.0x`) menggunakan algoritma time-domain SOLA, ditambah preset efek suara (*Chipmunk*, *Deep*, *Robot*, *Echo*, *Telephone*, *Radio*).
-- **Pengurang Derau (Denoise)**: Spectral gating berbasis STFT 1024-titik dengan penghalusan gain temporal dan filter high-pass 75Hz.
-- **Pemisah Vokal & Instrumen (2-Stem)**: Memisahkan komponen vokal dan musik pengiring menggunakan kombinasi *Harmonic-Percussive Source Separation* (HPSS), korelasi stereo Mid-Side, dan filter frekuensi vokal (135Hz–4.2kHz), yang hasilnya dapat langsung dikirim ke timeline video.
-- **Deteksi Ketukan (BPM) & Segmen Suara**: Deteksi onset ketukan berbasis *spectral flux* dan pembuatan segmen teks otomatis berdasarkan deteksi aktivitas suara (VAD).
-- **Ekspor Audio**: Penyimpanan hasil olahan audio ke format WAV PCM 16-bit.
+### 2. Editor Timeline Video (5 Track)
+- **5 Track Terpisah**: Video Utama (`MAIN_VIDEO`), Overlay PIP (`PIP_OVERLAY`), Teks/Keterangan (`TEXT_STICKER`), Musik (`MUSIC_BGM`), dan Rekaman Suara (`VOICEOVER`).
+- **Sinkronisasi Audio-Video Presisi**: Pemutaran pratinjau dikunci langsung ke jam perangkat keras `AudioTrack` dengan mekanisme *frame drop* otomatis jika dekode frame video terlambat, menjaga keselarasan bibir dan suara (*lip-sync*).
+- **Pengeditan Klip Lengkap**: Split, trim awal/akhir, geser posisi waktu, duplikasi, balik arah video (*reverse*), cerminkan (*mirror*), putar 90°, bekukan frame (*freeze frame*), stabilisasi 9-titik (*optical flow*), serta Undo/Redo 25 langkah.
+- **Koreksi Warna, 3D LUT, Kecepatan Kurva, Animasi, Keyframe, & Transisi**: 9 parameter warna, preset 3D LUT `17x17x17`, kurva kecepatan non-linier, animasi masuk/kombo, keyframe transformasi manual, dan transisi antar-klip.
+- **Penyimpanan Draf Proyek Otomatis (`ProjectPersistenceManager`)**: Seluruh perubahan pada timeline disimpan secara otomatis ke file JSON di penyimpanan lokal lengkap dengan izin akses URI persisten (`takePersistableUriPermission`), sehingga draf proyek dapat dibuka kembali kapan saja dari layar utama.
+
+### 3. Editor Audio (DAW)
+- **Equalizer 10-Band & Kompresor Dinamis**: Equalizer biquad `31Hz`–`16kHz` dan kompresor/limiter dengan indikator reduksi gain.
+- **Pengeditan Gelombang Suara**: Trim seleksi, potong tengah (*cut & stitch*), bisukan area (*silence*), normalisasi `0 dB` / `-1 dB`, *fade in/out*, *reverse*, pengubah nada (*pitch shift* `-12` s/d `+12` semitone), preset karakter suara, serta efek *reverb* & *delay*.
+- **Ekspor Audio**: Mendukung ekspor ke format **WAV Lossless (16-bit 44.1kHz)** dan **M4A (AAC 192kbps)**.
 
 ---
 
 ## Keunggulan dan Kekurangan (Apa Adanya)
 
 ### Keunggulan
-1. **Ukuran Ringan & Mandiri**: Tidak membundel pustaka berat atau model jaringan saraf ratusan megabyte, sehingga ukuran APK tetap kecil dan mudah dikompilasi.
-2. **Sepenuhnya Offline & Tanpa Telemetri**: Tidak memerlukan izin internet (`INTERNET` permission tidak digunakan), tanpa iklan, tanpa login, dan seluruh file media diproses di dalam penyimpanan lokal perangkat.
-3. **Integrasi Video dan Audio dalam Satu Aplikasi**: Pengguna dapat mengolah audio di halaman DAW (seperti melakukan denoise atau memisahkan vokal/instrumen) lalu langsung mengirim hasilnya ke track musik/voiceover di timeline video.
-4. **Pemrosesan Piksel dan DSP di C++**: Operasi intensif seperti koreksi warna per piksel, chroma key, interpolasi 3D LUT, STFT audio, dan equalizer dijalankan di kode native C++17 untuk mengurangi beban garbage collector di Kotlin/Java.
+1. **Sinkronisasi Audio-Video Berbasis Hardware Clock & Streaming Langsung**: Pemutaran timeline tidak lagi menunggu pencampuran seluruh trek di awal dan tidak lagi menggunakan *timer* terpisah yang menyebabkan suara dan gambar meleset (*drift*).
+2. **Model AI Visi & DSP Nyata Terbundel di Dalam APK**: Segmentasi subjek (*Selfie Segmentation*) dan pelacakan/retouch wajah (*Face Detection*) menggunakan model neural Google ML Kit yang tertanam langsung di APK, sehingga bekerja instan secara offline tanpa perlu mengunduh model tambahan saat pertama kali dijalankan.
+3. **Hemat Memori dengan Disk-Backed PCM Cache**: Dekode audio menggunakan buffer primitif dan cache file `.pcm16` di disk serta ringkasan gelombang 512-titik (`waveformPeaks`), sehingga antarmuka tetap responsif dan tidak mengalami *Out of Memory* pada proyek berdurasi panjang.
+4. **Sepenuhnya Offline & Privasi Terjaga**: Tanpa iklan, tanpa pelacak, dan seluruh proyek disimpan secara lokal di perangkat pengguna.
 
 ### Kekurangan & Keterbatasan
-1. **Fitur "AI" Menggunakan Algoritma Klasik (Bukan Deep Learning)**:
-   - Seluruh fitur otomatis di aplikasi ini menggunakan algoritma pemrosesan sinyal digital (DSP) dan statistik citra klasik di C++, **bukan** model jaringan saraf tiruan (neural network/deep learning).
-   - **Penghapus Latar (*Smart Cutout*)**: Bekerja dengan memodelkan warna tepi gambar dan mengasumsikan objek berada di area tengah. Fitur ini bekerja cukup baik pada latar belakang yang warnanya kontras dan relatif seragam, namun **tidak akurat** untuk latar belakang yang ramai/kompleks dibandingkan model segmentasi potret berbasis deep learning.
-   - **Pemisah Vokal (*Stem Separation*)**: Mengandalkan pemisahan harmonik-perkusi (HPSS) dan sinyal tengah stereo. Hasil pemisahan masih dapat menyisakan bocoran instrumen atau artefak fase, tidak sebersih model pemisah berbasis AI modern (seperti Demucs atau Spleeter).
-   - **Auto-Caption**: Hanya mendeteksi rentang waktu suara aktif (VAD) secara akustik dan mengandalkan fitur dikte suara bawaan sistem Android (`SpeechRecognizer`) jika tersedia di perangkat; belum memiliki model transkripsi suara-ke-teks mandiri di dalam aplikasi.
-2. **Performa Pratinjau Video Berbasis CPU**:
-   - Pengambilan frame pratinjau menggunakan `MediaMetadataRetriever` dan penggabungan layer dilakukan di atas `Bitmap`/`Canvas` CPU (dibantu cache memori 36 frame), belum menggunakan pipeline rendering GPU OpenGL/Vulkan penuh. Pada video beresolusi tinggi (4K) atau saat banyak layer aktif bersamaan, pratinjau dapat terasa patah-patah.
-3. **Batas Durasi Audio di Memori (RAM)**:
-   - Audio yang diimpor didekode ke dalam RAM sebagai array PCM `FloatArray` (dibatasi maksimal sekitar 3 menit per klip pada 44.1kHz stereo untuk mencegah aplikasi keluar paksa karena *Out of Memory*). Aplikasi ini cocok untuk klip pendek hingga menengah, namun tidak dirancang untuk mengedit audio/video berdurasi panjang (misalnya puluhan menit).
-4. **Penyimpanan Proyek Masih Berbasis Sesi**:
-   - Susunan timeline saat ini disimpan di memori selama aplikasi aktif dan belum dilengkapi penyimpanan database lokal untuk mengelola banyak draf proyek secara permanen setelah aplikasi ditutup paksa.
+1. **Kualitas Pemisah Vokal (2-Stem) Masih Berbasis Spektral 2D-HPSS, Bukan Demucs/MDX-Net Penuh**:
+   - Meskipun algoritma pemisah vokal di C++ telah ditingkatkan menggunakan STFT 2048-titik (overlap 75%), filter median 2D Fitzgerald, dan bobot forman vokal, metode ini tetap merupakan pemisahan spektral-fase matematis dan belum menyertakan model jaringan saraf pemisah instrumen berukuran ratusan megabyte (seperti *Hybrid Demucs*). Pada lagu dengan aransemen padat atau efek reverb vokal yang lebar, masih dapat terdengar sisa bocoran instrumen pada trek vokal.
+2. **Transkripsi Auto-Caption Bergantung pada Dukungan Layanan Pengenal Ucapan Perangkat**:
+   - Pada perangkat dengan Android 13+ (API 33+) yang memiliki paket bahasa offline *Google Speech Services* terpasang, aliran PCM dari video dapat ditranskripsi langsung menjadi kalimat akurat. Namun pada perangkat Android versi lama (API 26–32) atau perangkat tanpa mesin pengenal suara offline, sistem otomatis beralih ke analisis segmen suara/prosodi akustik lokal atau dikte mikrofon, sehingga teks hasil otomatis tetap perlu disunting ulang oleh pengguna.
+3. **Komposisi Frame Pratinjau Masih Berbasis Bitmap/Canvas CPU**:
+   - Meskipun pengambilan frame telah dipercepat menggunakan kumpulan `MediaMetadataRetriever` persisten (`retrieverPool`) dan cache LRU, penggabungan multi-layer dan efek piksel masih dirender melalui `Bitmap` CPU dan JNI C++, belum menggunakan *shader* OpenGL ES / Vulkan secara langsung. Pada video 4K dengan banyak efek aktif sekaligus, laju frame pratinjau dapat turun menyesuaikan kemampuan prosesor perangkat.
 
 ---
 

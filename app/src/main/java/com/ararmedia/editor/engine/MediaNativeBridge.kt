@@ -62,6 +62,13 @@ object MediaNativeBridge {
         reductionDb: Float
     )
 
+    external fun enhanceVoicePcm(
+        inSamples: FloatArray,
+        outSamples: FloatArray,
+        sampleRate: Int,
+        dereverbStrength: Float
+    )
+
     external fun splitStems(
         inStereoSamples: FloatArray,
         vocalsOut: FloatArray,
@@ -96,9 +103,33 @@ object MediaNativeBridge {
         feather: Float
     )
 
+    external fun applyNeuralMaskCutout(
+        srcBitmap: Bitmap,
+        dstBitmap: Bitmap,
+        confidenceMask: FloatArray,
+        maskWidth: Int,
+        maskHeight: Int,
+        threshold: Float,
+        feather: Float
+    )
+
+    external fun processFaceRetouch(
+        srcBitmap: Bitmap,
+        dstBitmap: Bitmap,
+        faceRectsNormalized: FloatArray,
+        numFaces: Int,
+        skinSmooth: Float,
+        faceRelight: Float
+    )
+
     external fun processStabilization(
         prevFrame: Bitmap,
         currFrame: Bitmap,
         transformOut: FloatArray
     )
+
+    external fun computeSceneDifference(
+        prevFrame: Bitmap,
+        currFrame: Bitmap
+    ): Float
 }

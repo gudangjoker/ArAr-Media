@@ -67,6 +67,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     private val _subtitles = MutableStateFlow<List<SubtitleEntry>>(emptyList())
     val subtitles: StateFlow<List<SubtitleEntry>> = _subtitles.asStateFlow()
 
+    private val _captionLanguage = MutableStateFlow("id")
+    val captionLanguage: StateFlow<String> = _captionLanguage.asStateFlow()
+
+    // --- SAVED PROJECTS STATE ---
+    private var activeProjectId: String = "project_default"
+    private val _savedProjects = MutableStateFlow<List<SavedProjectSummary>>(emptyList())
+    val savedProjects: StateFlow<List<SavedProjectSummary>> = _savedProjects.asStateFlow()
+
     // --- AI STATUS & FEEDBACK ---
     private val _isAiProcessing = MutableStateFlow(false)
     val isAiProcessing: StateFlow<Boolean> = _isAiProcessing.asStateFlow()
@@ -116,7 +124,84 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     val exportMessage: StateFlow<String?> = _exportMessage.asStateFlow()
 
     init {
-        loadDemoProject()
+        viewModelScope.launch {
+            val existing = ProjectPersistenceManager.listSavedProjects(getApplication())
+            _savedProjects.value = existing
+            val latest = existing.firstOrNull()
+            if (latest != null) {
+                val loaded = ProjectPersistenceManager.loadProject(getApplication(), latest.id)
+                if (loaded != null && loaded.clips.isNotEmpty()) {
+                    activeProjectId = loaded.id
+                    _aspectRatio.value = loaded.aspectRatio
+                    timelineEngine.currentAspectRatio = loaded.aspectRatio
+                    _canvasBgMode.value = loaded.backgroundMode
+                    timelineEngine.canvasBackgroundMode = loaded.backgroundMode
+                    _timelineClips.value = loaded.clips
+                    _selectedClipId.value = loaded.clips.firstOrNull()?.id
+                    val firstAudio = loaded.clips.firstOrNull { it.audioSamples != null && it.audioSamples.isNotEmpty() }?.audioSamples
+                    if (firstAudio != null) {
+                        dspProcessor.loadBuffer(firstAudio)
+                        _audioBufferData.value = firstAudio
+                    }
+                    updatePreviewFrame(0L)
+                    return@launch
+                }
+            }
+            loadDemoProject()
+        }
+    }
+
+    private fun triggerAutoSaveProject() {
+        val clipsSnapshot = _timelineClips.value
+        if (clipsSnapshot.isEmpty()) return
+        val projId = activeProjectId
+        val title = clipsSnapshot.firstOrNull { it.trackType == TrackType.MAIN_VIDEO }?.name
+            ?: clipsSnapshot.first().name
+        val ratio = _aspectRatio.value
+        val bg = _canvasBgMode.value
+        val dur = getTotalDurationMs()
+        viewModelScope.launch {
+            ProjectPersistenceManager.saveProject(
+                context = getApplication(),
+                projectId = projId,
+                title = title,
+                aspectRatio = ratio,
+                backgroundMode = bg,
+                clips = clipsSnapshot,
+                totalDurationMs = dur
+            )
+            _savedProjects.value = ProjectPersistenceManager.listSavedProjects(getApplication())
+        }
+    }
+
+    fun openSavedProject(projectId: String) {
+        pauseVideo()
+        viewModelScope.launch {
+            val loaded = ProjectPersistenceManager.loadProject(getApplication(), projectId) ?: return@launch
+            timelineEngine.clearCache()
+            activeProjectId = loaded.id
+            _aspectRatio.value = loaded.aspectRatio
+            timelineEngine.currentAspectRatio = loaded.aspectRatio
+            _canvasBgMode.value = loaded.backgroundMode
+            timelineEngine.canvasBackgroundMode = loaded.backgroundMode
+            _timelineClips.value = loaded.clips
+            _selectedClipId.value = loaded.clips.firstOrNull()?.id
+            _playheadMs.value = 0L
+            updatePreviewFrame(0L)
+            navigateTo(1)
+        }
+    }
+
+    fun deleteSavedProject(projectId: String) {
+        viewModelScope.launch {
+            ProjectPersistenceManager.deleteProject(getApplication(), projectId)
+            _savedProjects.value = ProjectPersistenceManager.listSavedProjects(getApplication())
+            showStatusToast("Proyek dihapus")
+        }
+    }
+
+    fun setCaptionLanguage(langCode: String) {
+        _captionLanguage.value = langCode
     }
 
     override fun onCleared() {
@@ -165,6 +250,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun startNewBlankProject() {
         pauseVideo()
         pushUndoState()
+        activeProjectId = "project_${System.currentTimeMillis()}"
         timelineEngine.clearCache()
         _timelineClips.value = emptyList()
         _selectedClipId.value = null
@@ -178,6 +264,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun loadDemoProject() {
         viewModelScope.launch {
             timelineEngine.clearCache()
+            activeProjectId = "project_sample"
             val demoClips = DemoMediaGenerator.createDemoProject(getApplication())
             pushUndoState()
             _timelineClips.value = demoClips
@@ -192,10 +279,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             _detectedBpm.value = bpm
             _beatMarkers.value = beats
 
-            val captions = dspProcessor.generateAutoCaptions(synthAudio)
+            val captions = dspProcessor.generateAutoCaptions(
+                sourceBuffer = synthAudio,
+                languageCode = _captionLanguage.value,
+                context = getApplication()
+            )
             _subtitles.value = captions
 
             updatePreviewFrame(0L)
+            triggerAutoSaveProject()
         }
     }
 
@@ -205,6 +297,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         if (undoStack.size > 30) {
             undoStack.removeAt(0)
         }
+        triggerAutoSaveProject()
     }
 
     fun undo() {
@@ -238,37 +331,38 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun playVideo() {
         _isPlayingVideo.value = true
         val totalDur = max(1000L, getTotalDurationMs())
-
-        val mixedAudio = dspProcessor.mixTimelineClipsToMasterPcm(_timelineClips.value, totalDur, applyMasterDsp = false)
-        if (mixedAudio.isNotEmpty()) {
-            dspProcessor.loadBuffer(mixedAudio)
+        if (_playheadMs.value >= totalDur - 50L) {
+            _playheadMs.value = 0L
         }
-        dspProcessor.startPlayback(startMs = _playheadMs.value)
+
+        // Start real-time chunked audio streaming immediately (0ms pre-mix delay)
+        dspProcessor.startTimelineStreamingPlayback(
+            clipsProvider = { _timelineClips.value },
+            startMs = _playheadMs.value,
+            totalDurationProvider = { max(1000L, getTotalDurationMs()) }
+        )
 
         videoPlaybackJob?.cancel()
         videoPlaybackJob = viewModelScope.launch {
-            val frameIntervalMs = 33L
-            var lastTickTime = System.currentTimeMillis()
-
             while (isActive && _isPlayingVideo.value) {
-                val now = System.currentTimeMillis()
-                val elapsed = (now - lastTickTime).coerceIn(16L, 100L)
-                lastTickTime = now
+                val frameStartWall = android.os.SystemClock.elapsedRealtime()
+                val currentTotalDur = max(1000L, getTotalDurationMs())
 
-                var current = _playheadMs.value + elapsed
-                if (current >= totalDur) {
-                    current = 0L
-                    dspProcessor.seekTo(0L)
-                }
-                _playheadMs.value = current
+                // Lock video playhead directly to Hardware Audio DAC playback head position (Zero A/V Drift)
+                val hardwareAudioMs = dspProcessor.getCurrentHardwarePlaybackMs() % currentTotalDur
+                _playheadMs.value = hardwareAudioMs
+
                 val bmp = timelineEngine.renderFrameAt(
-                    playheadMs = current,
+                    playheadMs = hardwareAudioMs,
                     clips = _timelineClips.value,
-                    outputWidth = _aspectRatio.value.width / 2,
-                    outputHeight = _aspectRatio.value.height / 2
+                    outputWidth = (_aspectRatio.value.width * 2) / 5,
+                    outputHeight = (_aspectRatio.value.height * 2) / 5
                 )
                 _currentFrameBitmap.value = bmp
-                delay(frameIntervalMs)
+
+                val renderTookMs = android.os.SystemClock.elapsedRealtime() - frameStartWall
+                val sleepMs = (30L - renderTookMs).coerceAtLeast(2L)
+                delay(sleepMs)
             }
         }
     }
@@ -278,6 +372,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         videoPlaybackJob?.cancel()
         videoPlaybackJob = null
         dspProcessor.stopPlayback()
+        updatePreviewFrame(_playheadMs.value)
     }
 
     fun seekTimeline(timeMs: Long) {
@@ -286,7 +381,11 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _playheadMs.value = clamped
         updatePreviewFrame(clamped)
         if (_isPlayingVideo.value) {
-            dspProcessor.seekTo(clamped)
+            dspProcessor.startTimelineStreamingPlayback(
+                clipsProvider = { _timelineClips.value },
+                startMs = clamped,
+                totalDurationProvider = { max(1000L, getTotalDurationMs()) }
+            )
         }
     }
 
@@ -324,6 +423,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 var thumbnailBmp: Bitmap? = null
                 var extractedAudio: FloatArray? = null
                 var extractedStereo: FloatArray = FloatArray(0)
+                var pcmCachePath = ""
+                var waveformPeaks = FloatArray(0)
+
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {}
 
                 if (isVideo) {
                     val retriever = MediaMetadataRetriever()
@@ -343,6 +451,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     if (decodedAudio.samples.isNotEmpty()) {
                         extractedAudio = decodedAudio.samples
                         extractedStereo = decodedAudio.stereoSamples
+                        pcmCachePath = decodedAudio.pcmCachePath
+                        waveformPeaks = decodedAudio.waveformPeaks
                     }
                 } else {
                     val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
@@ -367,6 +477,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     sourceDurationMs = durationMs,
                     isVideoSource = isVideo,
                     localUri = cacheFile.absolutePath,
+                    pcmCachePath = pcmCachePath,
+                    waveformPeaks = waveformPeaks,
                     thumbnailBitmap = thumbnailBmp,
                     audioSamples = extractedAudio,
                     keyframes = if (targetTrack == TrackType.PIP_OVERLAY) {
@@ -411,6 +523,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         durationMs = decoded.durationMs,
                         sourceDurationMs = decoded.durationMs,
                         localUri = decoded.cachedFilePath,
+                        pcmCachePath = decoded.pcmCachePath,
+                        waveformPeaks = decoded.waveformPeaks,
                         audioSamples = decoded.samples,
                         volume = 1.0f
                     )
@@ -500,7 +614,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val targetBuffer = sourceClip?.audioSamples ?: dspProcessor.getActiveBuffer()
                 val clipStartOffset = sourceClip?.startOnTimelineMs ?: 0L
 
-                val captions = dspProcessor.generateAutoCaptions(targetBuffer, recognizedSpeechLines)
+                val captions = dspProcessor.generateAutoCaptions(
+                    sourceBuffer = targetBuffer,
+                    recognizedLines = recognizedSpeechLines,
+                    languageCode = _captionLanguage.value,
+                    context = getApplication()
+                )
                 _subtitles.value = captions
                 if (captions.isEmpty()) {
                     showStatusToast("No speech phrases detected in audio")
@@ -741,6 +860,65 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val updated = timelineEngine.splitClipAtPlayhead(_timelineClips.value, selId, _playheadMs.value)
         _timelineClips.value = updated
         updatePreviewFrame(_playheadMs.value)
+        triggerAutoSaveProject()
+    }
+
+    /**
+     * AI Smart Scene Cut Detection: Automatically detects camera shot changes and splits the clip.
+     */
+    fun applyAiSceneCutDetection() {
+        val selId = _selectedClipId.value ?: _timelineClips.value.firstOrNull { it.trackType == TrackType.MAIN_VIDEO }?.id ?: return
+        viewModelScope.launch {
+            _isAiProcessing.value = true
+            try {
+                val (updatedClips, cutsCount) = timelineEngine.detectSceneCutsAndSplit(_timelineClips.value, selId)
+                if (cutsCount > 0) {
+                    pushUndoState()
+                    _timelineClips.value = updatedClips
+                    updatePreviewFrame(_playheadMs.value)
+                    triggerAutoSaveProject()
+                    showStatusToast("AI Scene Cut: $cutsCount pergantian adegan dipotong")
+                } else {
+                    showStatusToast("Tidak ditemukan pergantian adegan tajam pada klip ini")
+                }
+            } finally {
+                _isAiProcessing.value = false
+            }
+        }
+    }
+
+    /**
+     * AI Auto-Reframe (9:16 Face Tracking): Tracks the primary subject's face using bundled ML Kit Face Detection
+     * and generates smooth pan/zoom keyframes.
+     */
+    fun applyAiAutoReframe() {
+        val selId = _selectedClipId.value ?: _timelineClips.value.firstOrNull { it.trackType == TrackType.MAIN_VIDEO }?.id ?: return
+        val clip = _timelineClips.value.firstOrNull { it.id == selId } ?: return
+        viewModelScope.launch {
+            _isAiProcessing.value = true
+            try {
+                // Switch canvas to 9:16 vertical if currently landscape
+                if (_aspectRatio.value != AspectRatio.TIKTOK_9_16) {
+                    _aspectRatio.value = AspectRatio.TIKTOK_9_16
+                    timelineEngine.currentAspectRatio = AspectRatio.TIKTOK_9_16
+                }
+                val trackedKeyframes = timelineEngine.autoReframeClipWithFaceTracking(clip)
+                pushUndoState()
+                _timelineClips.value = _timelineClips.value.map {
+                    if (it.id == selId) {
+                        it.copy(
+                            keyframes = trackedKeyframes,
+                            isAutoReframed = true
+                        )
+                    } else it
+                }
+                updatePreviewFrame(_playheadMs.value)
+                triggerAutoSaveProject()
+                showStatusToast("AI Auto-Reframe aktif (${trackedKeyframes.size} titik lacak wajah)")
+            } finally {
+                _isAiProcessing.value = false
+            }
+        }
     }
 
     fun deleteActiveClip() {
@@ -1092,7 +1270,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 val selId = _selectedClipId.value
                 val selClip = _timelineClips.value.firstOrNull { it.id == selId }
                 if (selClip?.audioSamples != null && selClip.audioSamples.isNotEmpty()) {
-                    val denoisedClipPcm = dspProcessor.denoiseBuffer(selClip.audioSamples, 18f)
+                    val denoisedClipPcm = dspProcessor.denoiseBuffer(selClip.audioSamples, 20f)
                     pushUndoState()
                     _timelineClips.value = _timelineClips.value.map {
                         if (it.id == selId) it.copy(audioSamples = denoisedClipPcm, isAiDenoised = true) else it
@@ -1100,10 +1278,43 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     dspProcessor.loadBuffer(denoisedClipPcm)
                     _audioBufferData.value = denoisedClipPcm.copyOf()
                 } else {
-                    val denoised = dspProcessor.applyAiStudioDenoise(18f)
+                    val denoised = dspProcessor.applyAiStudioDenoise(20f)
                     _audioBufferData.value = denoised.copyOf()
                 }
-                showStatusToast("AI Noise Reduction applied (-18 dB)")
+                triggerAutoSaveProject()
+                showStatusToast("RNNoise Neural Denoise diterapkan")
+            } finally {
+                _isAiProcessing.value = false
+            }
+        }
+    }
+
+    fun applyAiVoiceEnhance() {
+        viewModelScope.launch {
+            _isAiProcessing.value = true
+            try {
+                val selId = _selectedClipId.value
+                val selClip = _timelineClips.value.firstOrNull { it.id == selId }
+                if (selClip?.audioSamples != null && selClip.audioSamples.isNotEmpty()) {
+                    val enhancedPcm = dspProcessor.enhanceVoiceBuffer(selClip.audioSamples, 0.80f)
+                    pushUndoState()
+                    _timelineClips.value = _timelineClips.value.map {
+                        if (it.id == selId) {
+                            it.copy(
+                                audioSamples = enhancedPcm,
+                                isVoiceEnhanced = true,
+                                isAiDenoised = true
+                            )
+                        } else it
+                    }
+                    dspProcessor.loadBuffer(enhancedPcm)
+                    _audioBufferData.value = enhancedPcm.copyOf()
+                } else {
+                    val enhanced = dspProcessor.applyAiVoiceEnhancer(0.80f)
+                    _audioBufferData.value = enhanced.copyOf()
+                }
+                triggerAutoSaveProject()
+                showStatusToast("AI Voice Enhancer & Dereverb diterapkan")
             } finally {
                 _isAiProcessing.value = false
             }

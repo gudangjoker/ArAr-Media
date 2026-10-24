@@ -13,8 +13,8 @@ android {
         applicationId = "com.ararmedia.editor"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -39,9 +39,14 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("RELEASE_STORE_FILE")
-            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
-                storeFile = file(keystorePath)
+            val envKeystore = System.getenv("RELEASE_STORE_FILE")
+            val keystoreFile = if (!envKeystore.isNullOrBlank() && file(envKeystore).exists()) {
+                file(envKeystore)
+            } else {
+                file("release-keystore.jks")
+            }
+            if (keystoreFile.exists()) {
+                storeFile = keystoreFile
                 storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "ararmedia123"
                 keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "ararmedia"
                 keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "ararmedia123"
@@ -52,12 +57,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            val keystorePath = System.getenv("RELEASE_STORE_FILE")
-            signingConfig = if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -65,6 +65,7 @@ android {
         }
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -102,4 +103,9 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+
+    // Bundled On-Device Neural Vision AI Engines (100% packaged inside APK)
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
+    implementation("com.google.mlkit:face-detection:16.1.7")
 }

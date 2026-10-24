@@ -348,18 +348,27 @@ fun AudioDawScreen(
                                 ) {
                                     Icon(Icons.Default.NoiseAware, contentDescription = "Denoise", modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("AI Noise Reduction", fontSize = 11.sp)
+                                    Text("RNNoise Denoise", fontSize = 11.sp)
                                 }
 
                                 Button(
-                                    onClick = { activeTab = 4; viewModel.runStemSeparation() },
-                                    colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent),
+                                    onClick = { viewModel.applyAiVoiceEnhance() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = StudioGoldAccent),
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    Icon(Icons.Default.CallSplit, contentDescription = "Split Stems", tint = Color.Black, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.RecordVoiceOver, contentDescription = "Voice Enhance", tint = Color.Black, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Vocal Remover", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.SemiBold)
+                                    Text("Voice Enhancer", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.SemiBold)
                                 }
+                            }
+                            Button(
+                                onClick = { activeTab = 4; viewModel.runStemSeparation() },
+                                colors = ButtonDefaults.buttonColors(containerColor = StudioCyanAccent),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.CallSplit, contentDescription = "Split Stems", tint = Color.Black, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("AI 2-Stem Separation (Vocals & Backing)", fontSize = 11.sp, color = Color.Black, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
@@ -384,7 +393,22 @@ fun AudioDawScreen(
                                 .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Text("Pitch Shift & Voice Effects", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Pitch Shift & Voice Effects", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                FilledTonalButton(
+                                    onClick = { viewModel.applyAiVoiceEnhance() },
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(28.dp)
+                                ) {
+                                    Icon(Icons.Default.RecordVoiceOver, contentDescription = null, tint = StudioGoldAccent, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("AI Voice Enhancer & Dereverb", fontSize = 10.sp, color = StudioGoldAccent)
+                                }
+                            }
 
                             Column {
                                 Text(

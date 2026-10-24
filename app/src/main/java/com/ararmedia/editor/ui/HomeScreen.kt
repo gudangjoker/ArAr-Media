@@ -44,6 +44,7 @@ fun HomeScreen(
     val clips by viewModel.timelineClips.collectAsState()
     val previewBmp by viewModel.currentFrameBitmap.collectAsState()
     val aspectRatio by viewModel.aspectRatio.collectAsState()
+    val savedProjects by viewModel.savedProjects.collectAsState()
 
     val newProjectMediaPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -77,9 +78,11 @@ fun HomeScreen(
                 Image(
                     painter = painterResource(id = R.drawable.app_logo),
                     contentDescription = "ArAr Media",
+                    contentScale = ContentScale.Crop,
                     modifier = Modifier
-                        .size(40.dp)
-                        .clip(RoundedCornerShape(10.dp))
+                        .size(42.dp)
+                        .clip(RoundedCornerShape(11.dp))
+                        .border(1.dp, StudioCyanAccent.copy(alpha = 0.35f), RoundedCornerShape(11.dp))
                 )
                 Column {
                     Text(
@@ -159,7 +162,7 @@ fun HomeScreen(
             }
         }
 
-        // Quick Studio Tools Grid
+        // Quick Studio Tools Grid (3 Rows of 4 Tools = 12 Studio & Bundled AI Tools)
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -197,6 +200,47 @@ fun HomeScreen(
                 ) {
                     viewModel.openAudioDawWithTab(0)
                     viewModel.applyAiDenoise()
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                QuickToolItem(
+                    icon = Icons.Default.CenterFocusStrong,
+                    label = "Auto Reframe",
+                    tint = StudioCyanAccent,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    viewModel.navigateTo(1)
+                    viewModel.applyAiAutoReframe()
+                }
+                QuickToolItem(
+                    icon = Icons.Default.AutoFixNormal,
+                    label = "Scene Cut",
+                    tint = StudioGreenAccent,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    viewModel.navigateTo(1)
+                    viewModel.applyAiSceneCutDetection()
+                }
+                QuickToolItem(
+                    icon = Icons.Default.RecordVoiceOver,
+                    label = "Voice AI",
+                    tint = StudioGoldAccent,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    viewModel.openAudioDawWithTab(0)
+                    viewModel.applyAiVoiceEnhance()
+                }
+                QuickToolItem(
+                    icon = Icons.Default.FaceRetouchingNatural,
+                    label = "Face Retouch",
+                    tint = StudioPinkAccent,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    viewModel.openVideoStudioWithTool("color")
                 }
             }
 
@@ -340,6 +384,65 @@ fun HomeScreen(
                                 modifier = Modifier.height(32.dp)
                             ) {
                                 Text("Audio Studio", color = Color.White, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Saved Projects on Disk (Auto-Saved JSON Drafts)
+            if (savedProjects.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Saved Drafts (${savedProjects.size})",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White
+                )
+
+                savedProjects.forEach { summary ->
+                    Card(
+                        onClick = { viewModel.openSavedProject(summary.id) },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = StudioSurfaceVariant.copy(alpha = 0.7f)),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, StudioCardBorder)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = summary.title,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.White
+                                )
+                                Text(
+                                    text = "${summary.clipCount} clips • ${formatTimecode(summary.durationMs)} • ${summary.aspectRatio.label}",
+                                    fontSize = 11.sp,
+                                    color = TextSecondary
+                                )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                TextButton(onClick = { viewModel.openSavedProject(summary.id) }) {
+                                    Text("Open", color = StudioCyanAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                IconButton(
+                                    onClick = { viewModel.deleteSavedProject(summary.id) },
+                                    modifier = Modifier.size(28.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.DeleteOutline,
+                                        contentDescription = "Delete Draft",
+                                        tint = StudioRedAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         }
                     }
