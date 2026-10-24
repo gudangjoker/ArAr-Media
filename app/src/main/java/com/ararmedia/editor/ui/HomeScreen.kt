@@ -423,7 +423,7 @@ fun HomeScreen(
                                     color = Color.White
                                 )
                                 Text(
-                                    text = "${summary.clipCount} clips • ${formatTimecode(summary.durationMs)} • ${summary.aspectRatio.label}",
+                                    text = "${summary.clipCount} clips • ${formatTimecode(summary.durationMs)} • ${summary.aspectRatioLabel}",
                                     fontSize = 11.sp,
                                     color = TextSecondary
                                 )
