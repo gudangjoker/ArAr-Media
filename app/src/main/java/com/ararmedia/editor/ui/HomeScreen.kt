@@ -108,7 +108,7 @@ fun HomeScreen(
             }
         }
 
-        // CapCut-Style "+ New Project" Primary Hero Card
+        // "+ New Project" Primary Hero Card
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -159,7 +159,7 @@ fun HomeScreen(
             }
         }
 
-        // Quick Studio Tools Grid (CapCut Style)
+        // Quick Studio Tools Grid
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),

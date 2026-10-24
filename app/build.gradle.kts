@@ -37,9 +37,27 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            val keystorePath = System.getenv("RELEASE_STORE_FILE")
+            if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("RELEASE_STORE_PASSWORD") ?: "ararmedia123"
+                keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: "ararmedia"
+                keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: "ararmedia123"
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            val keystorePath = System.getenv("RELEASE_STORE_FILE")
+            signingConfig = if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

@@ -64,7 +64,7 @@ class VideoTimelineEngine(val context: Context) {
     }
 
     /**
-     * Maps linear clip elapsed time through CapCut-style Speed Curve presets.
+     * Maps linear clip elapsed time through non-linear Speed Curve presets.
      */
     fun mapCurveElapsedMs(elapsedInClipMs: Long, clipDurationMs: Long, baseSpeed: Float, curve: SpeedCurvePreset): Long {
         val linearScaled = elapsedInClipMs * baseSpeed

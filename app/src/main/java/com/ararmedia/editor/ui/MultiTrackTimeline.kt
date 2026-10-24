@@ -434,7 +434,7 @@ private fun TrackLane(
                     )
                 }
 
-                // CapCut Left & Right Trim Handles when Selected
+                // Left & Right Trim Handles when Selected
                 if (isSelected) {
                     var initStartMs by remember(clip.id, clip.startOnTimelineMs) { mutableLongStateOf(clip.startOnTimelineMs) }
                     var leftDragPx by remember(clip.id) { mutableFloatStateOf(0f) }

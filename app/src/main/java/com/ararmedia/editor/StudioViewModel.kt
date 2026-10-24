@@ -572,7 +572,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Trims the left (start) edge of a clip on the timeline (CapCut left handle drag).
+     * Trims the left (start) edge of a clip on the timeline.
      */
     fun trimClipStart(clipId: String, newStartMs: Long) {
         _timelineClips.value = _timelineClips.value.map { clip ->
@@ -593,7 +593,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     /**
-     * Trims the right (end) edge of a clip on the timeline (CapCut right handle drag).
+     * Trims the right (end) edge of a clip on the timeline.
      */
     fun trimClipEnd(clipId: String, newDurationMs: Long) {
         _timelineClips.value = _timelineClips.value.map { clip ->

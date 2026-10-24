@@ -277,7 +277,7 @@ fun VideoStudioScreen(
                     }
                 }
 
-                // CapCut Transport Strip right below Preview
+                // Transport Strip right below Preview
                 Row(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -477,7 +477,7 @@ fun VideoStudioScreen(
                     .weight(if (activeBottomPanel != null) 0.34f else 0.42f)
             )
 
-            // 4. CapCut Bottom Action Toolbar
+            // 4. Bottom Action Toolbar
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
